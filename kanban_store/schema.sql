@@ -1,5 +1,6 @@
 -- Kanban schema (SQLite)
 -- v2: added projects + tasks.project_id (migration in Store._migrate_v2).
+-- v5: tasks.archived_at + rule_firings + command_runs + command_jobs (Store._migrate_v5).
 
 CREATE TABLE IF NOT EXISTS projects (
     id          TEXT PRIMARY KEY,                    -- 'finops', 'kanban-dev', ...
@@ -25,7 +26,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at      TEXT NOT NULL,                   -- ISO8601
     moved_at        TEXT NOT NULL,                   -- ISO8601, last status change
     column_order    INTEGER NOT NULL DEFAULT 0,      -- order within the column (for drag-drop)
-    project_id      TEXT NOT NULL DEFAULT 'default'  -- FK -> projects.id
+    project_id      TEXT NOT NULL DEFAULT 'default', -- FK -> projects.id
+    archived_at     TEXT                             -- ISO8601; NULL = visible on the board
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, column_order);
@@ -34,7 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
 
 CREATE TABLE IF NOT EXISTS task_links (
     task_id  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    type     TEXT NOT NULL,                          -- memory/file/pr/url
+    type     TEXT NOT NULL,                          -- memory/file/pr/url/plan
     value    TEXT NOT NULL,
     PRIMARY KEY (task_id, type, value)
 );
@@ -43,8 +45,8 @@ CREATE TABLE IF NOT EXISTS task_history (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     ts           TEXT NOT NULL,
-    actor        TEXT NOT NULL,                      -- user/agent:<name>
-    action       TEXT NOT NULL,                      -- create/move/comment/assign
+    actor        TEXT NOT NULL,                      -- user/agent:<name>/automation
+    action       TEXT NOT NULL,                      -- create/move/comment/assign/update/archive/unarchive
     from_status  TEXT,
     to_status    TEXT,
     comment      TEXT
@@ -65,6 +67,42 @@ CREATE TABLE IF NOT EXISTS project_sources (
     config        TEXT NOT NULL,              -- JSON: {file, repo_url, ...}
     last_sync_at  TEXT,                       -- ISO8601
     created_at    TEXT NOT NULL
+);
+
+-- One row per (rule, task, episode): a polling rule acts on a task at most
+-- once per stay in a column. ``anchor`` is the task's moved_at at the time
+-- the rule fired, so moving the task out and back starts a new episode.
+CREATE TABLE IF NOT EXISTS rule_firings (
+    rule_key  TEXT NOT NULL,
+    task_id   TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    anchor    TEXT NOT NULL,
+    fired_at  TEXT NOT NULL,
+    PRIMARY KEY (rule_key, task_id, anchor)
+);
+
+-- run_command launches per (rule, task), for the max_runs safety limit.
+-- Reset when the task is moved out of 'blocked' (a human says "try again").
+CREATE TABLE IF NOT EXISTS command_runs (
+    rule_key         TEXT NOT NULL,
+    task_id          TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    runs             INTEGER NOT NULL DEFAULT 0,
+    last_started_at  TEXT,
+    last_rc          INTEGER,
+    PRIMARY KEY (rule_key, task_id)
+);
+
+-- run_command jobs that are queued or running, so a server restart neither
+-- forgets queued launches nor loses track of agents still working.
+CREATE TABLE IF NOT EXISTS command_jobs (
+    rule_key    TEXT NOT NULL,
+    task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    state       TEXT NOT NULL,              -- queued | running
+    rule_name   TEXT NOT NULL,
+    ctx         TEXT NOT NULL,              -- JSON placeholders (task_id, title, ...)
+    pid         INTEGER,
+    queued_at   TEXT NOT NULL,
+    started_at  TEXT,
+    PRIMARY KEY (rule_key, task_id)
 );
 
 -- meta for migrations

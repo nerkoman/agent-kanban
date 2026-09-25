@@ -14,7 +14,7 @@ from .tasks import all_tasks
 
 def run() -> None:
     store = Store()
-    existing = {t.title for t in store.list_tasks()}
+    existing = {t.title for t in store.list_tasks(include_archived=True)}
     skipped = 0
     created = 0
     for spec in all_tasks():
