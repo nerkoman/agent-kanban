@@ -12,7 +12,15 @@ The kanban server is the same in all three cases — the difference is only how 
 
 ## 1. Claude Code (MCP)
 
-**Setup.** Add a project-scope `.mcp.json` in your repo root (or update `~/.claude.json` for global access):
+**Setup — one command.** Register the project on the board (UI → `+ New project`, pick its directory), then:
+
+```bash
+.venv/bin/python -m kanban_mcp.connect ~/code/myproj --project myproj
+```
+
+It writes (or merges into) `~/code/myproj/.mcp.json` and refreshes the "Kanban board" block in that project's `CLAUDE.md` (and `AGENTS.md` if there is one). Other MCP servers in the file are left alone; an existing kanban entry keeps its name. The project wizard in the UI does the same when "Connect Claude Code" is ticked, and `python -m kanban_store.maintenance doctor` lists registered projects that still lack a `.mcp.json`.
+
+**Setup — by hand.** The resulting project-scope `.mcp.json` (or put the same block into `~/.claude.json` for global access — `~/.claude/settings.json` is *not* read for MCP servers):
 
 ```jsonc
 {
@@ -36,23 +44,34 @@ The kanban server is the same in all three cases — the difference is only how 
 **`PYTHONPATH` is required**: Claude Code launches the stdio MCP server while ignoring the `cwd` field — without `PYTHONPATH`, python won't find the `kanban_mcp` module and MCP fails with `Failed to connect`.
 
 `KANBAN_DB` — absolute path to the SQLite file (especially important if Claude Code and the kanban live in different directories).
-`KANBAN_PROJECT_ID` — default project for `kanban_create` calls without an argument.
-`KANBAN_ACTOR` — author name written into `task_history` for every move/comment the agent makes. Set this to something other than `user` (e.g. `claude`) so the history clearly distinguishes agent actions from human drag-drops in the UI.
+`KANBAN_PROJECT_ID` — this agent's project: the default for `kanban_create` and the scope of `kanban_list` / `kanban_search` / `kanban_board` / `kanban_my_active` (pass `project_id="*"` to look across projects).
+`KANBAN_ACTOR` — author name written into `task_history` for every move/comment the agent makes (default `claude`), so the history distinguishes agent actions from human drag-drops.
+`KANBAN_MCP_HUMAN_ONLY` — statuses agents may not move or create cards into (default `done`; `uat,done,cancelled` for a stricter board, `""` to allow everything). The agent gets an error telling it to move the card to `testing` instead.
 
-Restart Claude Code (or run `claude mcp list` to confirm `✓ Connected`). 14 tools become available:
+Restart Claude Code (or run `claude mcp list` to confirm `✓ Connected`). 16 tools become available:
 
 | Tool | Purpose |
 |---|---|
 | `kanban_columns` | list of columns + ownership semantics |
-| `kanban_list` | tasks with optional status / assignee filters |
-| `kanban_get` | full card with history + links + blockers |
+| `kanban_projects` | projects with task counts per column |
+| `kanban_board` | compact overview of one project (counts + first cards per column) |
+| `kanban_list` | tasks with optional status / assignee / project filters |
+| `kanban_search` | substring search in title/description |
+| `kanban_my_active` | this agent's cards in analyst / in_progress / testing |
+| `kanban_get` | card with links, blockers and the newest 30 history rows (`history_total` = all) |
+| `kanban_history` | older history, page by page |
 | `kanban_pull` | atomically claim an `approved` task → `analyst`, assignee = current agent |
-| `kanban_move` | move card to a new column |
+| `kanban_move` | move card to a new column; `expected_from` refuses if someone moved it meanwhile |
+| `kanban_assign` | set or clear the assignee (hand the card to another agent or lane) |
 | `kanban_comment` | append comment to history |
-| `kanban_create` | new card |
-| `kanban_link` | attach memory/file/pr/url link |
-| `kanban_blockers` | set/replace inter-task blockers |
-| `kanban_update` | edit title/priority/size/description/blocker |
+| `kanban_create` | new card (unknown `project_id` is an error, not a silent default) |
+| `kanban_update` | edit title/priority/size/description/acceptance/external blocker (`""` clears it) |
+| `kanban_link` | attach memory/file/pr/url/plan link |
+| `kanban_blockers` | set/replace inter-task blockers (unknown ids and cycles are rejected) |
+
+Mutating tools answer with a short card (`id`, `status`, `url`, …), not the whole history. Arguments are strict: `project=` instead of `project_id=` is an error that names the right parameter, not a silently dropped value. Status names are forgiving: `"In progress"`, `"Testing"` and `"в работе"` all work.
+
+Changes made over MCP reach automation rules and webhooks the same way UI drag-drops do: every change lands in `task_history`, and the web server's event feed dispatches it within about a second (the web server has to be running for that part).
 
 **Example prompt for the agent:**
 
@@ -72,35 +91,35 @@ Ask Cline: *"What's in my kanban backlog?"* — it should call `kanban_list(stat
 
 ---
 
-## HTTP MCP transport (`http://localhost:7777/mcp`)
+## HTTP MCP transports (`/mcp` and `/sse`)
 
-In addition to the stdio server in `kanban_mcp/`, the kanban also exposes a **streamable HTTP MCP endpoint** at `/mcp`, mounted by `fastapi_mcp` directly on top of the REST routes (same FastAPI app, same data, no extra process).
+In addition to the stdio server in `kanban_mcp/`, the web server exposes the REST routes as MCP tools, mounted by `fastapi_mcp` on the same FastAPI app (same data, no extra process):
 
-Use this path when your MCP client doesn't speak stdio (Cursor, recent Cline) or for ad-hoc debugging (MCP Inspector). All operations available via the stdio server are available here too — same schemas.
+- `http://localhost:7777/mcp` — **streamable HTTP** (the current MCP transport);
+- `http://localhost:7777/sse` — legacy **SSE**, for clients that only speak that. (v0.1.x served SSE at `/mcp`; point such clients at `/sse` now.)
+
+Use this path when your MCP client doesn't speak stdio (Cursor, recent Cline) or for ad-hoc debugging (MCP Inspector). The tools here are the REST operations (names like `move_task_api_tasks__task_id__move_post`). Callers are treated as agents: `KANBAN_MCP_HUMAN_ONLY` applies (no closing cards by default), changes are recorded as `agent:mcp-http` unless the client sends `X-Kanban-Actor`, and endpoints that act on the host machine — native file pickers, the Claude CLI login, writing `.mcp.json`/`PLAN.md` into project folders, creating or repointing projects — and the automation pause switch are not exposed.
 
 Quick smoke check that the endpoint is live:
 
 ```bash
-curl -s -i --max-time 2 http://localhost:7777/mcp
-# → HTTP/1.1 200 OK
-# → content-type: text/event-stream
-# → event: endpoint
-# → data: /mcp/messages/?session_id=…
+curl -s -X POST http://localhost:7777/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+# → {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26",...}}
 ```
 
 ### Cursor (HTTP MCP) <a id="cursor-http-mcp"></a>
 
 [Cursor](https://cursor.com) speaks HTTP MCP natively.
 
-**Setup.** Open Cursor → `Cmd+,` (Settings) → search "MCP" → Add new server. Or edit `~/Library/Application Support/Cursor/User/settings.json` directly:
+**Setup.** Cursor → Settings → MCP → Add new server, or edit `~/.cursor/mcp.json` (global) / `.cursor/mcp.json` (per project):
 
 ```jsonc
 {
-  "mcp": {
-    "servers": {
-      "agent-kanban": {
-        "url": "http://localhost:7777/mcp"
-      }
+  "mcpServers": {
+    "agent-kanban": {
+      "url": "http://localhost:7777/mcp"
     }
   }
 }
@@ -127,7 +146,7 @@ npx @modelcontextprotocol/inspector http://localhost:7777/mcp
 
 In the Inspector UI:
 
-1. **Transport:** auto-detected as SSE on first connect.
+1. **Transport:** pick "Streamable HTTP" for `/mcp` (or "SSE" with `http://localhost:7777/sse`).
 2. **Tools tab:** lists all kanban operations exposed via the HTTP endpoint — click any to invoke with form inputs.
 3. **Network tab:** every request/response in raw JSON-RPC, useful when something feels off.
 
@@ -223,22 +242,36 @@ def dispatch(name, args):
 ## REST API reference
 
 - **Interactive Swagger UI**: `http://localhost:7777/docs`
-- **Static OpenAPI 3.1 spec**: [`docs/openapi.yaml`](openapi.yaml) (947 lines, 26 KB)
+- **Static OpenAPI 3.1 spec**: [`docs/openapi.yaml`](openapi.yaml) (regenerate with `make openapi`)
 - **Live JSON**: `http://localhost:7777/openapi.json`
 
 Key endpoints:
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/board?project=<id>` | board view (tasks grouped by column) |
+| GET | `/api/board?project=<id>` | board view (tasks grouped by column; each card carries `status`, `running`); `include_archived=true` |
 | GET | `/api/projects` | list of projects |
 | POST | `/api/projects` | create project |
-| GET | `/api/tasks/{id}` | full task with history |
+| POST | `/api/projects/{id}/connect` | write `.mcp.json` + CLAUDE.md block into the project directory |
+| GET | `/api/tasks/{id}` | task with the newest `history_limit` (default 200) history rows and `history_total` |
+| GET | `/api/tasks/{id}/history?limit=&before_id=` | history, page by page |
 | POST | `/api/tasks` | create task |
-| PATCH | `/api/tasks/{id}` | edit fields |
-| POST | `/api/tasks/{id}/move` | drag-drop result |
-| POST | `/api/tasks/{id}/comment` | comment in history |
+| PATCH | `/api/tasks/{id}` | edit fields (`external_blocker: ""` clears it) |
+| POST | `/api/tasks/{id}/move` | move; `expected_from` → 409 if the card is no longer there |
+| POST | `/api/tasks/{id}/assign` | set/clear assignee |
+| POST | `/api/tasks/{id}/archive` | hide from the board / restore (`{"archived": false}`), status kept |
+| POST | `/api/tasks/{id}/comment` | comment in history (`text`, alias `comment`) |
 | POST | `/api/tasks/{id}/links` | attach link |
+| POST | `/api/tasks/{id}/blockers` | replace internal blockers |
+| GET | `/api/automation/status` | inbox, rules (+ running/queued commands), event feed, webhooks |
+| POST | `/api/automation/pause` | `{"paused": true}` stops every rule — a kill switch for runaway pipelines |
+
+Request bodies are strict: unknown fields are a 422 instead of being ignored.
+
+**Who did it.** Scripts should name themselves with an `X-Kanban-Actor` header
+(`agent:launcher`, `ci`, `watchdog`, …) — it is written to the history instead
+of the server-wide `KANBAN_ACTOR` (default `user`), so a human's drag-drop and
+a script's move no longer look the same.
 
 ---
 
@@ -278,6 +311,12 @@ Fields:
 - `format`: `slack` (`{text: "..."}`), `telegram` (`{text: "..."}`, `chat_id` in URL), `generic` (raw JSON)
 - `project_id`: limit a webhook to one project; `null` = all projects
 - `enabled`: defaults to `true`
+
+Events come from the task history, so moves and comments made by MCP agents,
+scripts and automation rules are delivered too, not only UI actions. Payloads
+carry `actor` and the task with its newest 20 history rows (`history_total`
+tells the full count). Bulk imports (actor `plan-import`, see
+`KANBAN_EVENTS_QUIET_ACTORS`) are not announced.
 
 Delivery is a **fire-and-forget asyncio task**: the user's main HTTP request
 isn't blocked on webhook timeouts. Delivery logs (status_code, ms) live at

@@ -106,7 +106,7 @@ Optional: `bash scripts/install_launchd.sh install` — auto-start on login.
 - Cards are created idempotently (uniqueness on `project_id + title`)
 - Appends an instruction block to `CLAUDE.md` so Claude in that folder knows new tasks should be written into the plan file
 
-**Outcome:** an Aizav2 project with 183 tasks in one second, no copy-paste.
+**Outcome:** a project with 183 tasks in one second, no copy-paste.
 
 ---
 
@@ -149,17 +149,18 @@ UI alternative: `/p/myproj` → HIGH filter → density compact → everything v
 **Steps:** in `kanban_data/rules.json`:
 ```json
 { "rules": [{
-  "name": "Done > 30 days → cancelled",
+  "name": "Archive done cards after 30 days",
   "trigger": { "type": "task_idle", "status": "done", "days": 30 },
-  "action":  { "type": "move_to", "status": "cancelled",
-               "comment": "Auto-archive" }
+  "action":  { "type": "archive", "comment": "Auto-archive" }
 }]}
 ```
 
-**Outcome:** every 60 seconds (`KANBAN_AUTOMATION_INTERVAL`) the engine checks the rules and moves stale cards. All actions land in history with `actor=automation`.
+**Outcome:** every 60 seconds (`KANBAN_AUTOMATION_INTERVAL`) the engine checks the rules. Archived cards disappear from the board but stay `done` — counts and history keep telling the truth (`· N archived` in the top bar shows them again). A polling rule acts on a task **once per stay in the column**; add `"repeat_every": {"hours": 24}` for a daily reminder. All actions land in history with `actor=automation`.
 
-Supported triggers: `task_idle` (by `moved_at`), `task_count_in_status` (gt/lt).
-Supported actions: `move_to`, `add_comment`, `set_priority`.
+Supported triggers: `task_idle` (by `moved_at`; `days`/`hours`/`minutes`), `task_count_in_status` (gt/lt), `blockers_done` (every internal blocker is done/cancelled), `task_moved` (reactive).
+Supported actions: `move_to`, `add_comment`, `set_priority`, `assign`, `archive`, `run_command`.
+
+Don't use `move_to cancelled` for archiving: `cancelled` means "won't do", and done work relabelled that way makes the board say nothing was ever finished. Databases that already did this can be fixed with `python -m kanban_store.maintenance restore-archived --apply`.
 
 ---
 
@@ -242,7 +243,9 @@ The UI sidebar remembers the last-opened project (`localStorage.kb.lastProject`)
          "type": "run_command",
          "cmd": "/abs/path/to/agent-kanban/examples/agent-launcher/launch-claude.sh",
          "args": ["{task_id}", "{project_id}"],
-         "log_file": "~/Library/Logs/agent-kanban/launcher.log"
+         "log_file": "~/Library/Logs/agent-kanban/launcher.log",
+         "max_concurrent": 1,
+         "max_runs": 3
        }
      }]
    }
@@ -252,27 +255,31 @@ The UI sidebar remembers the last-opened project (`localStorage.kb.lastProject`)
 
 **What happens on drag-drop into Approved:**
 
-1. UI/API → `move_task(T-027, to_status="approved")` → DB write.
-2. The endpoint emits a `task_moved` event → the rule engine matches and runs `launch-claude.sh T-027 myproj` in the background.
-3. The script fetches the task description over REST, builds a prompt, and starts `claude -p "..." --permission-mode=acceptEdits` in the project directory in the background (`nohup ... &`).
-4. Through MCP, Claude calls `kanban_pull(T-027)` (approved → analyst, assignee=claude), posts a plan via `kanban_comment`, moves to `in_progress`, implements, and finally `kanban_move(T-027, "testing", comment="ready for review")`.
-5. In the UI you see the card in Testing, you review → drag into **UAT** → **Done**.
+1. UI, REST, an MCP agent or a script → `move_task(T-027, to_status="approved")` → a row in `task_history`.
+2. The server's event feed sees the row (within ~1 s, whoever wrote it) → the rule engine matches and starts `launch-claude.sh T-027 myproj`. A card *created* directly in Approved counts too.
+3. The launcher checks the card, the `claude` binary and the login, then runs `claude -p` in the project directory with an explicit `--mcp-config`, `--permission-mode dontAsk` and a timeout. It stays in the foreground while the agent works; the card shows a `▶ agent` chip.
+4. Through MCP, Claude calls `kanban_pull(T-027)` (approved → analyst, assignee=claude), posts a plan via `kanban_comment`, moves to `in_progress`, implements, and finally `kanban_move(T-027, "testing", comment="what was done, how it was verified")`.
+5. If the agent exits and leaves the card behind (crash, timeout, missing login), the launcher moves it to **Blocked** with the reason and the log path.
+6. In the UI you see the card in Testing, you review → drag into **UAT** → **Done**.
 
 **Triggers (rule.trigger.type=task_moved):**
 - `to_status` (required) — destination column.
-- `from_status` (optional) — source column. If set, it filters.
-- `project_id` (optional) — limit to one project.
+- `from_status` (optional) — source column. If set, it filters (a created card has none).
+- `project_id` (optional) — one slug or a list of slugs.
 
 **Action `run_command`:**
 - `cmd` — path to an executable (on the server).
-- `args` — list with placeholders: `{task_id}`, `{title}`, `{project_id}`, `{from_status}`, `{to_status}`.
-- `log_file` (optional) — if set, the script's stdout/stderr are written there.
+- `args` — list with placeholders: `{task_id}`, `{title}`, `{project_id}`, `{status}`, `{from_status}`, `{to_status}`.
+- `env` (optional) — extra environment variables.
+- `log_file` (optional) — stdout/stderr go there; by default to `kanban_data/logs/<rule>.log`.
+- `max_concurrent` (optional) — at most N processes of this rule at once; the rest wait in a queue.
+- `max_runs` (optional) — after N launches for the same card, block it instead of launching again (moving it out of Blocked resets the count). Exit code 75 is not counted.
 
-The script runs in the background (`asyncio.create_subprocess_exec`); the kanban **does not wait** for it to finish — an agent session can run for minutes or hours.
+One process per card and rule at a time: a second trigger while the first launch is alive is ignored. Processes start in their own session, so restarting the kanban does not kill running agents. `POST /api/automation/pause` (or the ⏸ button) stops all rules at once.
 
 **Security note:** `cmd` and `args` execute on the server with no sandboxing. Keep the script yours, and don't pull webhook payloads from untrusted sources into it.
 
-**Your own agent instead of Claude Code:** copy `launch-claude.sh` → `launch-myagent.sh`, replace `claude -p` with your CLI (`opencode`, `aider`, an OpenAI SDK wrapper). Same contract: fetch the task over REST, start the agent in the background.
+**Your own agent instead of Claude Code:** copy `launch-claude.sh` → `launch-myagent.sh`, replace `claude -p` with your CLI (`opencode`, `aider`, an OpenAI SDK wrapper). Same contract: fetch the task over REST, run the agent in the foreground, leave the card in a truthful column (and say why in a comment) before exiting.
 
 ---
 
@@ -293,7 +300,7 @@ Snapshots are gitignored by default (see `.gitignore`); flip the rule if you wan
 ## What's **not** in the current scope
 
 - Multi-user auth — the kanban listens on `127.0.0.1` only. If you want a team, run nginx with basic-auth or Authelia in front, or wait for the Roadmap "multi-user mode".
-- Bidirectional `PLAN.md` ↔ kanban — for now it's one-way (file → kanban). UI edits are **not written back** to the file (see Roadmap).
+- `PLAN.md` sync — importing a plan file is a one-shot action when you connect it; later edits to the file do not reach the board, and UI edits are not written back. Agents file new tasks with `kanban_create`.
 - Sub-tasks / hierarchy — `task_blockers` covers dependencies (DAG), but there's no real nesting.
 - Time tracking — `moved_at` and `created_at` exist in history; aggregate on top yourself via `/api/snapshot`.
 - GitHub Issues sync — `project_source.git` stores a URL+token, but issue import isn't implemented yet.

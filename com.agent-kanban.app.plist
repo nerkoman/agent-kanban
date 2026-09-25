@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Template для launchd: scripts/install_launchd.sh подставляет
-  __INSTALL_PATH__ в актуальный путь к репо при `install`.
-  НЕ загружай этот файл напрямую через launchctl — используй скрипт.
+  launchd template: scripts/install_launchd.sh substitutes __INSTALL_PATH__
+  and __HOME__ on `install`. Do not load this file with launchctl directly.
+  PATH and LANG matter for run_command rules: launchd starts services with a
+  minimal PATH (no claude/node) and no locale (non-ASCII args get mangled).
 -->
 <plist version="1.0">
 <dict>
@@ -27,7 +28,9 @@
         <key>KANBAN_PORT</key>
         <string>7777</string>
         <key>PATH</key>
-        <string>__INSTALL_PATH__/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__INSTALL_PATH__/.venv/bin:__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
     </dict>
 
     <key>RunAtLoad</key>

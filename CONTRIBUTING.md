@@ -17,11 +17,15 @@ python3 -m venv .venv
 ## Running tests
 
 ```bash
-.venv/bin/pytest tests/ -v
+uv run --extra dev pytest tests/ -q      # or: .venv/bin/pytest tests/ -q
 ```
 
-Currently covered: PLAN.md parser (loose-mode + canonical + idempotency).
-Adding tests for store / API endpoints is welcome.
+Covered: store (validation, history, archive, migrations), rule engine
+(idempotency, reactive rules through the event feed, `run_command`
+de-duplication / queueing / `max_runs`), REST API, MCP tools, PLAN.md import,
+the connect helper, maintenance commands, and `launch-claude.sh` end to end
+against a real server with a fake `claude` binary. Tests never touch the
+repo's `tasks.db` (see `tests/conftest.py`).
 
 ## Code style
 

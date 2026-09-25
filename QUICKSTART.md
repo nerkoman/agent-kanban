@@ -75,7 +75,15 @@ In the UI:
 
 ### Step 2 — connect the kanban MCP server to the project
 
-At the root of the code directory, create `.mcp.json`:
+Leave "Connect Claude Code" ticked in the project dialog, or run:
+
+```bash
+.venv/bin/python -m kanban_mcp.connect ~/code/myproj --project myproj
+```
+
+Either way you get a `.mcp.json` at the root of the code directory (other
+MCP servers in it are kept) and a "Kanban board" block in its `CLAUDE.md`
+with the workflow rules for agents. The generated entry looks like this:
 
 ```jsonc
 {
@@ -96,9 +104,8 @@ At the root of the code directory, create `.mcp.json`:
 }
 ```
 
-Heads up: `PYTHONPATH` is required — without it Claude ignores `cwd` and
-won't find the `kanban_mcp` module. Replace `/abs/path/to/agent-kanban` and
-`myproj` with your values.
+Heads up if you write it by hand: `PYTHONPATH` is required — without it
+Claude ignores `cwd` and won't find the `kanban_mcp` module.
 
 Verify the connection:
 ```bash
@@ -135,16 +142,20 @@ Create `kanban_data/rules.json`:
         "cmd": "/abs/path/to/agent-kanban/examples/agent-launcher/launch-claude.sh",
         "args": ["{task_id}", "{project_id}"],
         "log_file": "/Users/<you>/Library/Logs/agent-kanban/launcher.log",
-        "env": { "KANBAN_MCP_ALIAS": "agent-kanban" }
+        "max_concurrent": 1,
+        "max_runs": 3
       }
     }
   ]
 }
 ```
 
-`KANBAN_MCP_ALIAS` must match the key under `mcpServers` in `.mcp.json`
-(in the example above — `agent-kanban`). Hot-reload by mtime — no server
-restart needed.
+`max_concurrent: 1` — one agent at a time; more cards dragged to Approved
+wait in a queue. `max_runs: 3` — a card that keeps coming back is blocked
+after three launches instead of burning your usage limit overnight.
+The launcher passes the kanban MCP server to `claude` itself
+(`--mcp-config`), so the name in your `.mcp.json` does not matter.
+Hot-reload by mtime — no server restart needed.
 
 ### Step 5 — try it
 
@@ -153,8 +164,9 @@ restart needed.
    - Description: `GET /api/health → 200 {"status":"ok","ts":...}`
    - Acceptance: `curl localhost:7777/api/health returns 200`
 2. Drag it to **Approved** (or press space on the card).
-3. Within ~5 seconds → Claude moves it to `analyst`. A minute or two later → `testing`.
-4. Session logs: `tail -f ~/Library/Logs/agent-kanban/launcher-T-XXX-*.log`.
+3. Within a few seconds the card shows `▶ agent` and Claude moves it to `analyst`. A minute or two later → `testing`.
+4. Run folder with the prompt, the agent's output and the launcher log: `~/Library/Logs/agent-kanban/runs/T-XXX/`.
+5. If something goes wrong (no login, timeout, the agent quit halfway), the card lands in **Blocked** with the reason in its history.
 
 ---
 
@@ -172,11 +184,13 @@ restart needed.
 
 | Symptom | Where to look |
 |---|---|
-| `claude mcp list` → `Failed to connect` | check that `PYTHONPATH` in `.mcp.json` points at the agent-kanban root |
-| Task doesn't move from approved → analyst | `tail ~/Library/Logs/agent-kanban/launcher-T-*.log`; make sure `KANBAN_MCP_ALIAS` matches the key in `.mcp.json` |
-| Claude headless: "tool not allowed" | `--allowedTools` in `launch-claude.sh` must include `mcp__<alias>__kanban_*` |
+| `claude mcp list` → `Failed to connect` | re-run `python -m kanban_mcp.connect <dir> --project <id>`; by hand: `PYTHONPATH` in `.mcp.json` must point at the agent-kanban root |
+| Card went to **Blocked** with `launcher: …` | the comment says why (not logged in, timeout, agent left the card behind); details in `~/Library/Logs/agent-kanban/runs/T-XXX/` |
+| Card sits in Approved, nothing runs | ⏸ in the top bar is amber → automation is paused; otherwise see `rules.last_errors` in `/api/automation/status` |
+| Agent: "'done' is reserved for a human" | by design — agents stop at `testing`; see `KANBAN_MCP_HUMAN_ONLY` |
 | `C` button in topbar is grey | not logged in — clicking it kicks off the OAuth flow in your browser |
 | Drag-drop works but webhooks are silent | check the syntax of `kanban_data/webhooks.json`; status: `/api/automation/status.webhooks` |
+| Board feels slow, DB is large | `python -m kanban_store.maintenance doctor` |
 
 All event logs and errors are exposed at `GET /api/automation/status` (JSON).
 
