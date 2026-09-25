@@ -265,9 +265,11 @@ async def test_run_command_dedupes_and_queues(store, tmp_path):
     store.move_task(a.id, "backlog", actor="u")
     store.move_task(a.id, "approved", actor="u")
     await feed.dispatch_pending()
-    await asyncio.sleep(1.3)
-    lines = out.read_text().split("\n")
-    assert [ln for ln in lines if ln] == [f"start {a.id}", f"end {a.id}", f"start {b.id}", f"end {b.id}"]
+    def lines() -> list[str]:
+        return [ln for ln in (out.read_text().split("\n") if out.exists() else []) if ln]
+
+    assert await _wait_for(lambda: len(lines()) >= 4, timeout=15)
+    assert lines() == [f"start {a.id}", f"end {a.id}", f"start {b.id}", f"end {b.id}"]
 
 
 @pytest.mark.asyncio
@@ -279,16 +281,21 @@ async def test_max_runs_blocks_task_and_unblock_resets(store, tmp_path):
                        "max_runs": 2}}
     _engine(store, tmp_path, [rule])
     feed = EventFeed(store)
+    def idle() -> bool:
+        return not rules_mod.rules_status()["commands"]["running"]
+
     for _ in range(3):
         store.move_task(t.id, "approved", actor="u")
-        await _settle(feed, 0.3)
+        await feed.dispatch_pending()
+        assert await _wait_for(idle)
         if store.get_task(t.id).status == "approved":
             store.move_task(t.id, "in_progress", actor="u")
     task = store.get_task(t.id)
     assert task.status == "blocked"
     assert "max_runs=2" in task.history[-1].comment
     store.move_task(t.id, "approved", actor="u")      # a human unblocks → fresh budget
-    await _settle(feed, 0.3)
+    await feed.dispatch_pending()
+    assert await _wait_for(idle)
     assert store.get_task(t.id).status == "approved"
 
 
@@ -301,7 +308,9 @@ async def test_tempfail_exit_code_is_not_counted(store, tmp_path):
     _engine(store, tmp_path, [rule])
     feed = EventFeed(store)
     store.move_task(t.id, "approved", actor="u")
-    await _settle(feed, 0.4)
+    await feed.dispatch_pending()
+    assert await _wait_for(lambda: not rules_mod.rules_status()["commands"]["running"]
+                           and rules_mod.rules_status()["commands"]["finished"])
     assert store.command_runs(rules_mod.rule_key(rule), t.id) == 0
 
 
