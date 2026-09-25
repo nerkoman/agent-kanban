@@ -999,21 +999,22 @@ class Store:
 
     def save_command_job(
         self, rule_key: str, task_id: str, *, state: str, rule_name: str,
-        ctx: dict[str, Any], pid: int | None = None,
+        ctx: dict[str, Any], pid: int | None = None, proc_start: str | None = None,
     ) -> None:
         now = _now()
         with self._lock:
             self._conn.execute(
                 """INSERT INTO command_jobs
-                   (rule_key, task_id, state, rule_name, ctx, pid, queued_at, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   (rule_key, task_id, state, rule_name, ctx, pid, proc_start,
+                    queued_at, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(rule_key, task_id) DO UPDATE SET
                      state=excluded.state, rule_name=excluded.rule_name, ctx=excluded.ctx,
-                     pid=excluded.pid,
+                     pid=excluded.pid, proc_start=excluded.proc_start,
                      started_at=CASE WHEN excluded.state='running' THEN excluded.started_at
                                      ELSE command_jobs.started_at END""",
                 (rule_key, task_id, state, rule_name,
-                 json.dumps(ctx, ensure_ascii=False), pid, now,
+                 json.dumps(ctx, ensure_ascii=False), pid, proc_start, now,
                  now if state == "running" else None),
             )
 
@@ -1025,8 +1026,11 @@ class Store:
 
     def list_command_jobs(self) -> list[dict[str, Any]]:
         with self._lock:
+            # running first, then the queue in insertion order (rowid: the
+            # upsert keeps it when a queued job starts)
             rows = self._conn.execute(
-                "SELECT * FROM command_jobs ORDER BY queued_at, rule_key, task_id"
+                "SELECT * FROM command_jobs "
+                "ORDER BY CASE state WHEN 'running' THEN 0 ELSE 1 END, rowid"
             ).fetchall()
         return [{**dict(r), "ctx": json.loads(r["ctx"])} for r in rows]
 

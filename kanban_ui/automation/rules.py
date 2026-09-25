@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -381,12 +382,8 @@ def _apply_action(
     context: dict[str, Any] | None = None,
     *,
     rule: dict[str, Any] | None = None,
-) -> tuple[str, bool]:
-    """Applies an action. Returns (short description for the log, settled).
-
-    ``settled`` is False only when a run_command launch is waiting in the
-    queue — a polling rule then does not mark the task as handled yet, so a
-    launch lost to a server restart is retried on a later tick.
+) -> str:
+    """Applies an action and returns a short description for the log.
 
     ``context`` is an optional dict with values used to substitute
     run_command placeholders (task_id, project_id, from_status,
@@ -394,7 +391,7 @@ def _apply_action(
     """
     if action["type"] == "run_command":
         return _submit_command(store, task_id, action, context, rule)
-    return _apply_simple_action(store, task_id, action), True
+    return _apply_simple_action(store, task_id, action)
 
 
 def _apply_simple_action(store: Store, task_id: str, action: dict[str, Any]) -> str:
@@ -446,7 +443,7 @@ def _apply_simple_action(store: Store, task_id: str, action: dict[str, Any]) -> 
 def _submit_command(
     store: Store, task_id: str, action: dict[str, Any],
     context: dict[str, Any] | None, rule: dict[str, Any] | None,
-) -> tuple[str, bool]:
+) -> str:
     # context is substituted into args as {task_id}, {project_id},
     # {from_status}, {to_status}, {title}, {status}.
     ctx = dict(context or {})
@@ -455,7 +452,7 @@ def _submit_command(
     try:
         args = [str(a).format(**ctx) for a in raw_args]
     except (KeyError, IndexError, ValueError) as e:
-        return f"run_command: bad placeholder {e}", True
+        return f"run_command: bad placeholder {e}"
     name = (rule or {}).get("name", "run_command")
     key = rule_key(rule) if rule else f"cmd:{action['cmd']}"
     return _commands.submit(
@@ -498,43 +495,54 @@ class CommandRunner:
     * ``max_runs`` per (rule, task): after that many launches the task is
       moved to ``blocked`` instead of launching again — a guard against
       pipelines that bounce a card between "agent" and "checks failed" all
-      night. Moving the task out of ``blocked`` resets the counter.
+      night. A person moving the task out of ``blocked`` resets the counter.
     * Exit code 75 (EX_TEMPFAIL, e.g. the model's usage limit was hit) does
       not count as a run.
     * Processes start in their own session, so restarting the kanban
       server (or launchd killing its process group) does not kill agents.
     * The child gets a UTF-8 locale when the server has none (launchd
       starts services with an empty LANG).
-    * Queued and running jobs are kept in the ``command_jobs`` table: after a
-      server restart queued launches are resumed and agents still running
-      keep their slot (tracked by pid) instead of being forgotten.
+    * Queued and running jobs are kept in the ``command_jobs`` table. When
+      the server stops, running agents keep their row (they go on working);
+      the next server re-attaches to them — checking pid *and* process start
+      time, so a reused pid is not mistaken for the agent — and then resumes
+      the queue in its original order.
     """
+
+    ORPHAN_TTL = timedelta(days=7)
 
     def __init__(self) -> None:
         self._running: dict[tuple[str, str], dict[str, Any]] = {}
         self._queues: dict[str, deque[dict[str, Any]]] = {}
         self._limits: dict[str, int | None] = {}
         self.history: list[dict[str, Any]] = []   # last finished: {ts, rule, task_id, pid, rc}
+        self.orphans: list[dict[str, Any]] = []   # persisted jobs whose rule is not loaded
+        self.stopping = False
+
+    def shutdown(self) -> None:
+        """The server is going down: start nothing new, keep persisted state."""
+        self.stopping = True
 
     def _running_for(self, key: str) -> int:
         return sum(1 for (k, _t) in self._running if k == key)
 
+    def _is_queued(self, key: str, task_id: str) -> bool:
+        return any(j["task_id"] == task_id for j in self._queues.get(key, ()))
+
     def submit(self, *, store: Store | None, key: str, rule_name: str, task_id: str,
                cmd: str, args: list[str], env_extra: dict[str, Any], log_file: str,
                max_concurrent: int | None, max_runs: int | None,
-               ctx: dict[str, Any]) -> tuple[str, bool]:
-        """Start or queue a launch. Returns (description, settled) — see
-        _apply_action; settled is False while the job waits in the queue."""
+               ctx: dict[str, Any]) -> str:
+        """Start or queue a launch; returns a short description for the log."""
         job = {"key": key, "rule": rule_name, "task_id": task_id, "cmd": cmd,
                "args": args, "env": env_extra, "log_file": log_file, "ctx": ctx,
                "queued_at": _ts(), "store": store}
         self._limits[key] = max_concurrent
         name = Path(cmd).name
         if (key, task_id) in self._running:
-            return f"run_command {name}: already running for {task_id}", True
-        queue = self._queues.setdefault(key, deque())
-        if any(j["task_id"] == task_id for j in queue):
-            return f"run_command {name}: already queued for {task_id}", False
+            return f"run_command {name}: already running for {task_id}"
+        if self._is_queued(key, task_id):
+            return f"run_command {name}: already queued for {task_id}"
         if store is not None and max_runs is not None:
             runs = store.command_runs(key, task_id)
             if runs >= max_runs:
@@ -544,24 +552,27 @@ class CommandRunner:
                              f"(max_runs={max_runs}); not launching again. "
                              "Move the card out of Blocked to allow new runs."),
                 )
-                return f"run_command {name}: max_runs={max_runs} reached, task blocked", True
-        if _status.get("paused") or (
+                return f"run_command {name}: max_runs={max_runs} reached, task blocked"
+        queue = self._queues.setdefault(key, deque())
+        if self.stopping or _status.get("paused") or (
             max_concurrent is not None and self._running_for(key) >= max_concurrent
         ):
             queue.append(job)
             self._persist(job, "queued")
-            return f"run_command {name} queued ({len(queue)} waiting)", False
+            return f"run_command {name} queued ({len(queue)} waiting)"
         self._start(job)
-        return f"run_command {name} {args}", True
+        return f"run_command {name} {args}"
 
     @staticmethod
-    def _persist(job: dict[str, Any], state: str, pid: int | None = None) -> None:
+    def _persist(job: dict[str, Any], state: str, pid: int | None = None,
+                 proc_start: str | None = None) -> None:
         st = job.get("store")
         if st is None:
             return
         try:
             st.save_command_job(job["key"], job["task_id"], state=state,
-                                rule_name=job["rule"], ctx=job["ctx"], pid=pid)
+                                rule_name=job["rule"], ctx=job["ctx"], pid=pid,
+                                proc_start=proc_start)
         except Exception:  # noqa: BLE001 — bookkeeping only
             log.exception("run_command: could not persist job state")
 
@@ -577,63 +588,20 @@ class CommandRunner:
 
     def _start(self, job: dict[str, Any]) -> None:
         # Raises RuntimeError outside an event loop — before anything is reserved.
-        asyncio.get_running_loop().create_task(self._run(job))
+        task = asyncio.get_running_loop().create_task(self._run(job))
         # Reserve the slot synchronously (the coroutine hasn't run yet) so a
         # burst of events can't overshoot max_concurrent.
-        self._running[(job["key"], job["task_id"])] = {**job, "pid": None, "started_at": _ts()}
+        self._running[(job["key"], job["task_id"])] = {
+            **job, "pid": None, "started_at": _ts(), "_task": task}
         if job.get("store") is not None:
             job["store"].bump_command_runs(job["key"], job["task_id"])
-
-    def restore(self, store: Store, rules: list[dict[str, Any]]) -> None:
-        """Pick up jobs a previous server process left in ``command_jobs``."""
-        by_key = {rule_key(r): r for r in rules}
-        for row in store.list_command_jobs():
-            key, task_id = row["rule_key"], row["task_id"]
-            if (key, task_id) in self._running:
-                continue
-            rule = by_key.get(key)
-            if row["state"] == "running":
-                pid = row["pid"]
-                if not pid or not _pid_alive(pid):
-                    store.delete_command_job(key, task_id)
-                    continue
-                if rule is not None:
-                    self._limits[key] = rule["action"].get("max_concurrent")
-                job = {"key": key, "rule": row["rule_name"], "task_id": task_id,
-                       "cmd": "(started before restart)", "args": [], "ctx": row["ctx"],
-                       "queued_at": row["queued_at"], "store": store}
-                self._running[(key, task_id)] = {**job, "pid": pid,
-                                                 "started_at": row["started_at"]}
-                asyncio.get_running_loop().create_task(self._watch(job, pid))
-                log.info("run_command: re-attached to pid %s for %s (%s)",
-                         pid, task_id, row["rule_name"])
-                continue
-            task = store.get_task(task_id, history_limit=0)
-            if rule is None or task is None or task.archived_at:
-                store.delete_command_job(key, task_id)
-                continue
-            store.delete_command_job(key, task_id)
-            desc, _settled = _apply_action(store, task_id, rule["action"], row["ctx"], rule=rule)
-            log.info("run_command: resumed queued launch for %s: %s", task_id, desc)
-
-    async def _watch(self, job: dict[str, Any], pid: int) -> None:
-        """Follow a process that is not our child (started before a restart)."""
-        try:
-            while _pid_alive(pid):
-                await asyncio.sleep(2)
-        finally:
-            self._forget(job)
-            self._running.pop((job["key"], job["task_id"]), None)
-            self.history.insert(0, {"ts": _ts(), "rule": job["rule"],
-                                    "task_id": job["task_id"], "pid": pid, "rc": None})
-            self.history = self.history[:20]
-            self.drain(job["key"])
 
     async def _run(self, job: dict[str, Any]) -> None:
         slot = (job["key"], job["task_id"])
         rc: int | None = None
         pid: int | None = None
         fh = None
+        interrupted = False
         try:
             log_path = Path(job["log_file"]).expanduser()
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -651,7 +619,7 @@ class CommandRunner:
             )
             pid = proc.pid
             self._running[slot]["pid"] = pid
-            self._persist(job, "running", pid)
+            self._persist(job, "running", pid, await _proc_start_time(pid))
             log.info("run_command spawned: pid=%d cmd=%s args=%s ctx=%s",
                      pid, job["cmd"], job["args"], job["ctx"])
             rc = await proc.wait()
@@ -660,6 +628,9 @@ class CommandRunner:
                          job["cmd"], job["task_id"])
             elif rc != 0:
                 _push_error(job["rule"], f"{job['task_id']}: {Path(job['cmd']).name} exited {rc}")
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
         except FileNotFoundError:
             log.error("run_command: cmd not found: %s", job["cmd"])
             _push_error(job["rule"], f"executable not found: {job['cmd']}")
@@ -672,24 +643,114 @@ class CommandRunner:
         finally:
             if fh is not None:
                 fh.close()
-            st = job.get("store")
-            if st is not None:
-                try:
-                    if rc == EX_TEMPFAIL or pid is None:
-                        st.bump_command_runs(job["key"], job["task_id"], -1)
-                    st.set_command_rc(job["key"], job["task_id"], rc)
-                except Exception:  # noqa: BLE001 — bookkeeping only
-                    log.exception("run_command bookkeeping failed")
-            self._forget(job)
-            self._running.pop(slot, None)
-            self.history.insert(0, {"ts": _ts(), "rule": job["rule"],
-                                    "task_id": job["task_id"], "pid": pid, "rc": rc})
-            self.history = self.history[:20]
-            self.drain(job["key"])
+            if rc is None and pid is not None and (interrupted or self.stopping):
+                # The server is stopping while the agent works on in its own
+                # session: keep its row, the next server re-attaches to it.
+                self._running.pop(slot, None)
+            else:
+                self._finish(job, pid, rc)
+
+    def _finish(self, job: dict[str, Any], pid: int | None, rc: int | None) -> None:
+        st = job.get("store")
+        if st is not None:
+            try:
+                if rc == EX_TEMPFAIL or pid is None:
+                    st.bump_command_runs(job["key"], job["task_id"], -1)
+                st.set_command_rc(job["key"], job["task_id"], rc)
+            except Exception:  # noqa: BLE001 — bookkeeping only
+                log.exception("run_command bookkeeping failed")
+        self._forget(job)
+        self._running.pop((job["key"], job["task_id"]), None)
+        self.history.insert(0, {"ts": _ts(), "rule": job["rule"],
+                                "task_id": job["task_id"], "pid": pid, "rc": rc})
+        self.history = self.history[:20]
+        self.drain(job["key"])
+
+    def restore(self, store: Store, rules: list[dict[str, Any]],
+                *, rules_ok: bool = True) -> None:
+        """Pick up jobs a previous server process left in ``command_jobs``.
+
+        Running jobs are re-attached first (pid + process start time must
+        match), then queued ones are resubmitted in their original order.
+        A job whose rule can't be found keeps its row — by key, else by rule
+        name (an edited rule gets a new key) — and is listed as orphaned; if
+        rules.json failed to load (``rules_ok=False``), queued jobs wait.
+        """
+        by_key = {rule_key(r): r for r in rules}
+        by_name = {r.get("name"): r for r in rules if r.get("name")}
+        rows = store.list_command_jobs()
+        self.orphans = []
+
+        def current(row: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+            rule = by_key.get(row["rule_key"]) or by_name.get(row["rule_name"])
+            return (rule_key(rule) if rule else row["rule_key"]), rule
+
+        for row in (r for r in rows if r["state"] == "running"):
+            key, rule = current(row)
+            task_id = row["task_id"]
+            if (key, task_id) in self._running or (row["rule_key"], task_id) in self._running:
+                continue
+            pid = row["pid"]
+            if not pid or not _same_process(pid, row.get("proc_start")):
+                store.delete_command_job(row["rule_key"], task_id)
+                continue
+            if rule is not None:
+                self._limits[key] = rule["action"].get("max_concurrent")
+            job = {"key": key, "rule": rule.get("name", row["rule_name"]) if rule else row["rule_name"],
+                   "task_id": task_id, "cmd": "(started before restart)", "args": [],
+                   "ctx": row["ctx"], "queued_at": row["queued_at"], "store": store}
+            if key != row["rule_key"]:
+                store.delete_command_job(row["rule_key"], task_id)
+                self._persist(job, "running", pid, row.get("proc_start"))
+            watcher = asyncio.get_running_loop().create_task(self._watch(job, pid))
+            self._running[(key, task_id)] = {**job, "pid": pid,
+                                             "started_at": row["started_at"], "_task": watcher}
+            log.info("run_command: re-attached to pid %s for %s (%s)", pid, task_id, job["rule"])
+
+        cutoff = _now() - self.ORPHAN_TTL
+        for row in (r for r in rows if r["state"] == "queued"):
+            key, rule = current(row)
+            task_id = row["task_id"]
+            if (key, task_id) in self._running or self._is_queued(key, task_id):
+                continue
+            if rule is None:
+                if rules_ok and _parse_iso(row["queued_at"]) < cutoff:
+                    store.delete_command_job(row["rule_key"], task_id)
+                else:
+                    self.orphans.append({"rule": row["rule_name"], "task_id": task_id,
+                                         "queued_at": row["queued_at"]})
+                continue
+            task = store.get_task(task_id, history_limit=0)
+            if task is None or task.archived_at:
+                store.delete_command_job(row["rule_key"], task_id)
+                continue
+            store.delete_command_job(row["rule_key"], task_id)
+            desc = _apply_action(store, task_id, rule["action"], row["ctx"], rule=rule)
+            log.info("run_command: resumed queued launch for %s: %s", task_id, desc)
+
+    async def _watch(self, job: dict[str, Any], pid: int) -> None:
+        """Follow a process that is not our child (started before a restart)."""
+        interrupted = False
+        try:
+            while _pid_alive(pid):
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
+        finally:
+            if (interrupted or self.stopping) and _pid_alive(pid):
+                self._running.pop((job["key"], job["task_id"]), None)
+            else:
+                self._forget(job)
+                self._running.pop((job["key"], job["task_id"]), None)
+                self.history.insert(0, {"ts": _ts(), "rule": job["rule"],
+                                        "task_id": job["task_id"], "pid": pid, "rc": None})
+                self.history = self.history[:20]
+                self.drain(job["key"])
 
     def drain(self, key: str | None = None) -> None:
         """Start queued jobs while slots are free (and automation isn't paused)."""
-        if _status.get("paused"):
+        if self.stopping or _status.get("paused"):
             return
         keys = [key] if key is not None else list(self._queues)
         for k in keys:
@@ -712,6 +773,7 @@ class CommandRunner:
                 {"rule": j["rule"], "task_id": j["task_id"], "queued_at": j["queued_at"]}
                 for q in self._queues.values() for j in q
             ],
+            "orphaned": list(self.orphans),
             "finished": list(self.history),
         }
 
@@ -720,13 +782,42 @@ EX_TEMPFAIL = 75  # sysexits.h: "try again later" (rate limit, service down)
 
 
 def _pid_alive(pid: int) -> bool:
+    """True if ``pid`` exists and is ours to signal. A process of another
+    user (PermissionError) can't be an agent we started."""
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         return False
-    except PermissionError:
-        return True
     return True
+
+
+async def _proc_start_time(pid: int) -> str | None:
+    """Start time of ``pid`` as ``ps`` reports it — with the pid, identifies
+    the process across server restarts (pids get reused, e.g. after a reboot)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ps", "-o", "lstart=", "-p", str(pid),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    except (OSError, asyncio.TimeoutError):
+        return None
+    text = out.decode("utf-8", "replace").strip()
+    return text or None
+
+
+def _same_process(pid: int, proc_start: str | None) -> bool:
+    if not _pid_alive(pid):
+        return False
+    if not proc_start:
+        return False            # can't tell it apart from a reused pid
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out == proc_start
+
 
 _commands = CommandRunner()
 
@@ -757,15 +848,14 @@ def _run_once(store: Store, rules: list[dict[str, Any]]) -> list[dict[str, Any]]
             try:
                 if not _should_fire(store, rule, key, task):
                     continue
-                desc, settled = _apply_action(
+                desc = _apply_action(
                     store, task.id, rule["action"], _task_context(task), rule=rule
                 )
                 # Remember the episode even when the action was a no-op
                 # ("priority already high"): re-checking every tick is what
-                # used to flood the history. A launch still waiting in the
-                # queue is not remembered yet, so it is retried if lost.
-                if settled:
-                    store.record_rule_firing(key, task.id, task.moved_at)
+                # used to flood the history. A queued launch counts too — the
+                # queue is persisted, so it isn't lost to a restart.
+                store.record_rule_firing(key, task.id, task.moved_at)
                 if room is not None:
                     room -= 1
                 actions_log.append(
@@ -833,7 +923,7 @@ def emit_rule_event(event: str, payload: dict[str, Any]) -> list[str]:
                 "to_status":   payload.get("to_status", ""),
             }
             try:
-                desc, _settled = _apply_action(_engine.store, task_id, rule["action"], ctx, rule=rule)
+                desc = _apply_action(_engine.store, task_id, rule["action"], ctx, rule=rule)
                 applied.append(desc)
                 _status["last_reactive"].insert(0, {
                     "ts": _ts(),
@@ -867,7 +957,9 @@ class RuleEngine:
         self._stop = asyncio.Event()
         self._rules: list[dict[str, Any]] = []
         self._mtime: float | None = None
+        self._load_errors: list[str] = []
         self._recent: dict[tuple[str, str], deque[datetime]] = {}
+        _commands.stopping = False
 
     def _loop_guard(self, key: str, task_id: str) -> bool:
         now = _now()
@@ -894,7 +986,9 @@ class RuleEngine:
         for e in errs:
             _push_error("_config_", e)
         was_paused = _status.get("paused")
+        had_errors = bool(self._load_errors)
         self._rules = rules
+        self._load_errors = errs
         self._mtime = mtime
         _status["paused"] = paused
         _status["rules_loaded"] = len(rules)
@@ -908,6 +1002,13 @@ class RuleEngine:
                 _commands.drain()
             except RuntimeError:
                 pass  # no running loop (sync caller); the next tick drains
+        if had_errors and not errs:
+            # rules.json was broken at the last (re)start; queued jobs of its
+            # rules were kept waiting — resume them now that it loads.
+            try:
+                _commands.restore(self.store, self._rules)
+            except RuntimeError:
+                pass
 
     async def run(self) -> None:
         _status["running"] = True
@@ -916,7 +1017,7 @@ class RuleEngine:
         log.info("rule engine started: %s (interval=%ss)", self.rules_file, self.interval)
         try:
             self._maybe_reload()
-            _commands.restore(self.store, self._rules)
+            _commands.restore(self.store, self._rules, rules_ok=not self._load_errors)
         except Exception:
             log.exception("rule engine: could not restore command jobs")
         try:
@@ -940,4 +1041,6 @@ class RuleEngine:
             log.info("rule engine stopped")
 
     def stop(self) -> None:
+        # Running agents keep working and keep their rows; nothing new starts.
+        _commands.shutdown()
         self._stop.set()

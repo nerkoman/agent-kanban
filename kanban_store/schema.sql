@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS command_jobs (
     rule_name   TEXT NOT NULL,
     ctx         TEXT NOT NULL,              -- JSON placeholders (task_id, title, ...)
     pid         INTEGER,
+    proc_start  TEXT,                       -- `ps -o lstart=` of pid: tells a reused pid apart
     queued_at   TEXT NOT NULL,
     started_at  TEXT,
     PRIMARY KEY (rule_key, task_id)

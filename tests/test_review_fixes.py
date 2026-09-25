@@ -1,6 +1,7 @@
 """Regression tests for defects found in review before v0.2.0 shipped."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -119,22 +120,26 @@ async def test_queued_and_running_jobs_survive_a_restart(store, tmp_path):
     st = rules_mod.rules_status()["commands"]
     assert [r["task_id"] for r in st["running"]] == [a.id]       # re-attached by pid
     assert [q["task_id"] for q in st["queued"]] == [b.id]         # still waiting its turn
-    desc, _ = rules_mod._apply_action(store, a.id, rule["action"], {"task_id": a.id}, rule=rule)
+    desc = rules_mod._apply_action(store, a.id, rule["action"], {"task_id": a.id}, rule=rule)
     assert "already running" in desc
     assert await _wait_for(lambda: f"end {b.id}" in (out.read_text() if out.exists() else ""),
                            timeout=10)
     assert await _wait_for(lambda: store.list_command_jobs() == [], timeout=5)
 
 
-def test_polling_rule_does_not_mark_queued_launch_as_done(store, tmp_path):
+def test_polling_rule_records_a_queued_launch(store, tmp_path):
+    """A queued launch counts as the rule having acted (the queue is
+    persisted): otherwise every tick queued — and later ran — it again."""
     rule = {"name": "stuck", "trigger": {"type": "task_idle", "status": "approved", "minutes": 0},
             "action": {"type": "run_command", "cmd": "/bin/true", "max_concurrent": 1}}
     eng = _engine(store, tmp_path, [rule], paused=False)
     t = store.create_task("x", project_id="proj", status="approved")
     rules_mod._status["paused"] = True          # queue instead of starting
     _run_once(store, eng._rules)
-    assert store.rule_last_fired(rules_mod.rule_key(rule), t.id, t.moved_at) is None
+    _run_once(store, eng._rules)
+    assert store.rule_last_fired(rules_mod.rule_key(rule), t.id, t.moved_at) is not None
     assert [j["state"] for j in store.list_command_jobs()] == ["queued"]
+    assert len(rules_mod.rules_status()["commands"]["queued"]) == 1
 
 
 # --- max_runs is reset by people, not by machines ---------------------------
@@ -243,3 +248,96 @@ def test_dedupe_keeps_rows_separated_by_people_or_time(store):
     comments = [h.comment for h in Store(store.db_path).get_task(t.id).history
                 if h.actor == "automation"]
     assert comments == ["escalated", "escalated", "daily reminder", "daily reminder"]
+
+
+# --- shutdown / restore details ------------------------------------------------
+
+
+def _sleeper(seconds: int = 30) -> tuple[subprocess.Popen, str]:
+    proc = subprocess.Popen(["sleep", str(seconds)])
+    start = subprocess.run(["ps", "-o", "lstart=", "-p", str(proc.pid)],
+                           capture_output=True, text=True).stdout.strip()
+    return proc, start
+
+
+@pytest.mark.asyncio
+async def test_shutdown_keeps_agents_and_starts_nothing(store, tmp_path):
+    hook = _script(tmp_path, "sleep 3")
+    rule = {"name": "agent", "trigger": {"type": "task_moved", "to_status": "approved"},
+            "action": {"type": "run_command", "cmd": str(hook), "max_concurrent": 1}}
+    eng = _engine(store, tmp_path, [rule])
+    feed = EventFeed(store)
+    a = store.create_task("a", project_id="proj")
+    b = store.create_task("b", project_id="proj")
+    store.move_task(a.id, "approved", actor="u")
+    store.move_task(b.id, "approved", actor="u")
+    await feed.dispatch_pending()
+    assert await _wait_for(lambda: any(j["pid"] for j in store.list_command_jobs()))
+    running = rules_mod._commands._running[(rules_mod.rule_key(rule), a.id)]
+    eng.stop()                                    # lifespan shutdown …
+    running["_task"].cancel()                     # … then the loop cancels tasks
+    await asyncio.sleep(0.2)
+    jobs = {j["task_id"]: j["state"] for j in store.list_command_jobs()}
+    assert jobs == {a.id: "running", b.id: "queued"}   # nothing forgotten, B not started
+    assert rules_mod.rules_status()["commands"]["running"] == []
+
+    rules_mod._commands = rules_mod.CommandRunner()      # next server
+    rules_mod._commands.restore(store, eng._rules)
+    st = rules_mod.rules_status()["commands"]
+    assert [r["task_id"] for r in st["running"]] == [a.id]
+    assert [q["task_id"] for q in st["queued"]] == [b.id]
+
+
+@pytest.mark.asyncio
+async def test_restore_reattaches_before_resuming_the_queue(store, tmp_path):
+    rule = {"name": "agent", "trigger": {"type": "task_moved", "to_status": "approved"},
+            "action": {"type": "run_command", "cmd": "/bin/true", "max_concurrent": 1}}
+    key = rules_mod.rule_key(rule)
+    a = store.create_task("a", project_id="proj", status="approved")
+    b = store.create_task("b", project_id="proj", status="approved")
+    proc, start = _sleeper()
+    try:
+        # queued row written first (lower rowid), running row second
+        store.save_command_job(key, a.id, state="queued", rule_name="agent", ctx={"task_id": a.id})
+        store.save_command_job(key, b.id, state="running", rule_name="agent",
+                               ctx={"task_id": b.id}, pid=proc.pid, proc_start=start)
+        rules_mod._commands.restore(store, [rule])
+        st = rules_mod.rules_status()["commands"]
+        assert [r["task_id"] for r in st["running"]] == [b.id]
+        assert [q["task_id"] for q in st["queued"]] == [a.id]
+    finally:
+        proc.kill()
+
+
+@pytest.mark.asyncio
+async def test_restore_does_not_trust_a_reused_pid(store, tmp_path):
+    rule = {"name": "agent", "trigger": {"type": "task_moved", "to_status": "approved"},
+            "action": {"type": "run_command", "cmd": "/bin/true", "max_concurrent": 1}}
+    t = store.create_task("a", project_id="proj", status="approved")
+    proc, _start = _sleeper()
+    try:
+        store.save_command_job(rules_mod.rule_key(rule), t.id, state="running", rule_name="agent",
+                               ctx={"task_id": t.id}, pid=proc.pid,
+                               proc_start="Mon Jan  1 00:00:00 2024")
+        rules_mod._commands.restore(store, [rule])
+        assert rules_mod.rules_status()["commands"]["running"] == []
+        assert store.list_command_jobs() == []
+    finally:
+        proc.kill()
+
+
+@pytest.mark.asyncio
+async def test_queued_jobs_of_a_missing_rule_are_kept(store, tmp_path):
+    t = store.create_task("a", project_id="proj", status="approved")
+    store.save_command_job("h:gone", t.id, state="queued", rule_name="old rule",
+                           ctx={"task_id": t.id})
+    rules_mod._commands.restore(store, [], rules_ok=False)
+    assert [j["task_id"] for j in store.list_command_jobs()] == [t.id]
+    assert rules_mod.rules_status()["commands"]["orphaned"][0]["rule"] == "old rule"
+    # an edited rule (new key, same name) picks the job up
+    edited = {"name": "old rule", "trigger": {"type": "task_moved", "to_status": "approved"},
+              "action": {"type": "run_command", "cmd": "/bin/true", "max_concurrent": 1}}
+    rules_mod._status["paused"] = True
+    rules_mod._commands.restore(store, [edited])
+    jobs = store.list_command_jobs()
+    assert [(j["rule_key"], j["state"]) for j in jobs] == [(rules_mod.rule_key(edited), "queued")]

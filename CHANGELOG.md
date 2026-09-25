@@ -69,8 +69,10 @@ wrong there.
   `max_concurrent` with a queue, `max_runs` (block the card instead of the
   N+1-th launch; a person moving it out of Blocked resets the count — rules
   and agents don't), exit code 75 = "try again later", not counted. Queued
-  and running jobs are stored in the database: after a server restart queued
-  launches resume and agents that are still working keep their slot. Running
+  and running jobs are stored in the database: a server that stops leaves
+  working agents alone and starts nothing new; the next one re-attaches to
+  them (pid and process start time must match) before resuming the queue in
+  order. Jobs whose rule isn't loaded are kept and listed, not dropped. Running
   and queued commands are listed in `/api/automation/status`, and cards show
   `▶ agent` while one runs.
 - **Agent launcher v2** (`examples/agent-launcher/launch-claude.sh`):
