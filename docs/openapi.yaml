@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Kanban
-  version: '2.0'
+  version: 0.2.0
 paths:
   /:
     get:
@@ -39,6 +39,72 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /t/{task_id}:
+    get:
+      summary: Index For Task
+      description: 'Link to one card: the board of its project with the card open.'
+      operationId: index_for_task_t__task_id__get
+      parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Task Id
+      - name: project_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Project Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            text/html:
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /p/{project_id}/t/{task_id}:
+    get:
+      summary: Index For Task
+      description: 'Link to one card: the board of its project with the card open.'
+      operationId: index_for_task_p__project_id__t__task_id__get
+      parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Task Id
+      - name: project_id
+        in: path
+        required: true
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Project Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            text/html:
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/board:
     get:
       summary: Get Board
@@ -48,11 +114,31 @@ paths:
         in: query
         required: false
         schema:
-          type: string
-          description: project_id
-          default: default
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: project slug
           title: Project
-        description: project_id
+        description: project slug
+      - name: project_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: alias of `project`
+          title: Project Id
+        description: alias of `project`
+      - name: include_archived
+        in: query
+        required: false
+        schema:
+          type: boolean
+          description: also return archived tasks
+          default: false
+          title: Include Archived
+        description: also return archived tasks
       responses:
         '200':
           description: Successful Response
@@ -359,6 +445,43 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/projects/{project_id}/connect:
+    post:
+      summary: Connect Project
+      description: 'Write/merge ``.mcp.json`` in the project directory and refresh
+        its
+
+        CLAUDE.md block, so agents working there get the kanban tools.'
+      operationId: connect_project_api_projects__project_id__connect_post
+      parameters:
+      - name: project_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Project Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Connect Project Api Projects  Project Id  Connect
+                  Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/projects/{project_id}/archive:
     post:
       summary: Archive Project
@@ -403,6 +526,17 @@ paths:
         schema:
           type: string
           title: Task Id
+      - name: history_limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 5000
+          minimum: 0
+          description: newest history rows to include; see /history for older ones
+          default: 200
+          title: History Limit
+        description: newest history rows to include; see /history for older ones
       responses:
         '200':
           description: Successful Response
@@ -428,6 +562,14 @@ paths:
         schema:
           type: string
           title: Task Id
+      - name: x-kanban-actor
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Kanban-Actor
       requestBody:
         required: true
         content:
@@ -449,24 +591,78 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/tasks/{task_id}/history:
+    get:
+      summary: Get Task History
+      operationId: get_task_history_api_tasks__task_id__history_get
+      parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Task Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 1000
+          minimum: 1
+          default: 100
+          title: Limit
+      - name: before_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          description: return rows older than this history id
+          title: Before Id
+        description: return rows older than this history id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Get Task History Api Tasks  Task Id  History Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/tasks:
     post:
       summary: Create Task
       operationId: create_task_api_tasks_post
+      parameters:
+      - name: x-kanban-actor
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Kanban-Actor
       requestBody:
+        required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/TaskCreate'
-        required: true
       responses:
         '201':
           description: Successful Response
           content:
             application/json:
               schema:
-                additionalProperties: true
                 type: object
+                additionalProperties: true
                 title: Response Create Task Api Tasks Post
         '422':
           description: Validation Error
@@ -485,6 +681,14 @@ paths:
         schema:
           type: string
           title: Task Id
+      - name: x-kanban-actor
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Kanban-Actor
       requestBody:
         required: true
         content:
@@ -506,6 +710,89 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/tasks/{task_id}/assign:
+    post:
+      summary: Assign Task
+      operationId: assign_task_api_tasks__task_id__assign_post
+      parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Task Id
+      - name: x-kanban-actor
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Kanban-Actor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Assign Task Api Tasks  Task Id  Assign Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/tasks/{task_id}/archive:
+    post:
+      summary: Archive Task
+      description: 'Hide a task from the board (``archived=false`` restores it). The
+
+        status is kept — an archived ``done`` task is still ``done``.'
+      operationId: archive_task_api_tasks__task_id__archive_post
+      parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Task Id
+      - name: x-kanban-actor
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Kanban-Actor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskArchiveRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Archive Task Api Tasks  Task Id  Archive Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/tasks/{task_id}/comment:
     post:
       summary: Add Comment
@@ -517,6 +804,14 @@ paths:
         schema:
           type: string
           title: Task Id
+      - name: x-kanban-actor
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Kanban-Actor
       requestBody:
         required: true
         content:
@@ -581,6 +876,14 @@ paths:
         schema:
           type: string
           title: Task Id
+      - name: x-kanban-actor
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Kanban-Actor
       requestBody:
         required: true
         content:
@@ -618,7 +921,8 @@ paths:
   /api/automation/status:
     get:
       summary: Get Automation Status
-      description: State of the inbox watcher, rule engine, and webhook dispatcher.
+      description: State of the inbox watcher, rule engine, event feed and webhook
+        dispatcher.
       operationId: get_automation_status_api_automation_status_get
       responses:
         '200':
@@ -629,6 +933,36 @@ paths:
                 additionalProperties: true
                 type: object
                 title: Response Get Automation Status Api Automation Status Get
+  /api/automation/pause:
+    post:
+      summary: Pause Automation
+      description: 'Pause (or resume) every automation rule — a kill switch for runaway
+
+        agent pipelines. Writes ``"paused"`` into rules.json; events that happen
+
+        while paused are not replayed later.'
+      operationId: pause_automation_api_automation_pause_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Pause Automation Api Automation Pause Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/system/claude-auth-status:
     get:
       summary: Claude Auth Status
@@ -721,6 +1055,17 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
 components:
   schemas:
+    AssignRequest:
+      properties:
+        assignee:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Assignee
+          description: null or empty string clears it
+      additionalProperties: false
+      type: object
+      title: AssignRequest
     BlockersRequest:
       properties:
         blocker_ids:
@@ -728,6 +1073,7 @@ components:
             type: string
           type: array
           title: Blocker Ids
+      additionalProperties: false
       type: object
       required:
       - blocker_ids
@@ -737,10 +1083,28 @@ components:
         text:
           type: string
           title: Text
+      additionalProperties: false
       type: object
       required:
       - text
       title: CommentRequest
+    ConnectRequest:
+      properties:
+        alias:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Alias
+          description: server name in .mcp.json
+        actor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Actor
+          description: 'KANBAN_ACTOR (default: keep existing, else claude)'
+      additionalProperties: false
+      type: object
+      title: ConnectRequest
     HTTPValidationError:
       properties:
         detail:
@@ -750,6 +1114,21 @@ components:
           title: Detail
       type: object
       title: HTTPValidationError
+    LinkIn:
+      properties:
+        type:
+          type: string
+          title: Type
+          description: one of memory, file, pr, url, plan
+        value:
+          type: string
+          title: Value
+      additionalProperties: false
+      type: object
+      required:
+      - type
+      - value
+      title: LinkIn
     LinkRequest:
       properties:
         type:
@@ -758,6 +1137,7 @@ components:
         value:
           type: string
           title: Value
+      additionalProperties: false
       type: object
       required:
       - type
@@ -778,10 +1158,26 @@ components:
           - type: string
           - type: 'null'
           title: Comment
+        expected_from:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Expected From
+          description: only move if the task is still in this status (409 otherwise)
+      additionalProperties: false
       type: object
       required:
       - to_status
       title: MoveRequest
+    PauseRequest:
+      properties:
+        paused:
+          type: boolean
+          title: Paused
+          default: true
+      additionalProperties: false
+      type: object
+      title: PauseRequest
     ProjectArchiveRequest:
       properties:
         archived:
@@ -879,6 +1275,20 @@ components:
           title: File
       type: object
       title: SourcePlanLocalRequest
+    TaskArchiveRequest:
+      properties:
+        archived:
+          type: boolean
+          title: Archived
+          default: true
+        comment:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Comment
+      additionalProperties: false
+      type: object
+      title: TaskArchiveRequest
     TaskCreate:
       properties:
         title:
@@ -904,6 +1314,11 @@ components:
           type: string
           title: Size
           default: M
+        assignee:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Assignee
         external_blocker:
           anyOf:
           - type: string
@@ -911,15 +1326,14 @@ components:
           title: External Blocker
         links:
           items:
-            additionalProperties:
-              type: string
-            type: object
+            $ref: '#/components/schemas/LinkIn'
           type: array
           title: Links
         project_id:
           type: string
           title: Project Id
           default: default
+      additionalProperties: false
       type: object
       required:
       - title
@@ -956,6 +1370,8 @@ components:
           - type: string
           - type: 'null'
           title: External Blocker
+          description: '"" clears the external blocker; null leaves it unchanged'
+      additionalProperties: false
       type: object
       title: TaskUpdate
     ValidationError:

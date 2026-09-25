@@ -1,7 +1,7 @@
 """FastAPI app for the kanban board. Every mutation is recorded in history
 with actor=KANBAN_ACTOR env var (default 'user').
 
-Endpoints (v2):
+Endpoints:
     GET    /                          — HTML (root, default project)
     GET    /p/{project_id}            — HTML for a specific project
     GET    /api/board?project=        — tasks of a project + column meta
@@ -9,43 +9,57 @@ Endpoints (v2):
     POST   /api/projects              — create a project
     PATCH  /api/projects/{id}         — update (name/color/icon/sort_order)
     POST   /api/projects/{id}/archive — archive (toggle)
-    GET    /api/tasks/{task_id}       — full card with history
+    GET    /api/tasks/{task_id}       — card with the newest history rows
+    GET    /api/tasks/{task_id}/history — paginated history
     POST   /api/tasks                 — create (project_id in payload)
     PATCH  /api/tasks/{task_id}       — update fields
     POST   /api/tasks/{task_id}/move  — drag-drop result
+    POST   /api/tasks/{task_id}/assign
+    POST   /api/tasks/{task_id}/archive
     POST   /api/tasks/{task_id}/comment
     POST   /api/tasks/{task_id}/links
     POST   /api/tasks/{task_id}/blockers
     POST   /api/snapshot              — persist a board snapshot
+    GET    /api/automation/status     — inbox / rules / events / webhooks
+    POST   /api/automation/pause      — pause or resume automation rules
+
+Scripts can name themselves in history with an ``X-Kanban-Actor`` header
+(e.g. ``agent:launcher``); without it the actor is ``KANBAN_ACTOR`` or ``user``.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import shutil
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
-from kanban_store import Store, STATUSES, status_meta
-from kanban_store.store import DEFAULT_PROJECT_ID
+from kanban_store import Store, STATUSES, StatusConflict, status_meta
+from kanban_store.store import DEFAULT_PROJECT_ID, LINK_TYPES, normalize_status
+from kanban_mcp.connect import DEFAULT_ALIAS, connect as connect_mcp, detect_alias
+from kanban_mcp.policy import check_agent_may_use
+from kanban_ui import __version__
 from kanban_ui.automation import (
+    EventFeed,
     InboxWatcher,
     RuleEngine,
+    events_status,
     inbox_status,
     rules_status,
-    emit_rule_event,
+    set_paused,
     init_dispatcher,
     shutdown_dispatcher,
-    emit_event,
     webhooks_status,
     plan_md,
 )
@@ -57,14 +71,41 @@ logging.basicConfig(
 log = logging.getLogger("kanban.ui")
 
 
-def _actor() -> str:
+_ACTOR_RE = re.compile(r"^[\w.:@()\- ]{1,64}$", re.UNICODE)
+
+
+# Set by the HTTP MCP bridge (see the bottom of this file) on the requests it
+# makes on behalf of an MCP client; not part of the public API schema.
+MCP_VIA = "mcp-http"
+
+
+def _actor(header: str | None = None, via: str | None = None) -> str:
     """Name of the mutation author recorded in task_history.
 
-    Pulled from the ``KANBAN_ACTOR`` env variable; defaults to ``user``.
-    Suitable for single-user installations; for multi-user setups replace
-    this with a cookie/header lookup.
+    ``X-Kanban-Actor`` request header (scripts, launchers) → ``agent:mcp-http``
+    for HTTP MCP clients → ``KANBAN_ACTOR`` env → ``user``. The header is
+    only a label for the history, not auth.
     """
+    if header:
+        header = header.strip()
+        if not _ACTOR_RE.match(header):
+            raise HTTPException(400, "X-Kanban-Actor: 1-64 chars of letters, digits, . : @ ( ) - _ or space")
+        return header
+    if via == MCP_VIA:
+        return "agent:mcp-http"
     return os.environ.get("KANBAN_ACTOR", "user")
+
+
+def _guard_agent_status(status: str, via: str | None) -> None:
+    """HTTP MCP clients are agents: same KANBAN_MCP_HUMAN_ONLY rule as stdio."""
+    if via != MCP_VIA:
+        return
+    try:
+        denied = check_agent_may_use(normalize_status(status))
+    except ValueError:
+        return  # the endpoint reports the bad status itself
+    if denied:
+        raise HTTPException(403, denied)
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +117,13 @@ ROOT = Path(__file__).resolve().parent.parent
 KANBAN_DATA = ROOT / "kanban_data"
 
 _store = Store()
+_feed: EventFeed | None = None
+
+
+def _kick() -> None:
+    """Let the event feed pick up a write made by this request right away."""
+    if _feed is not None:
+        _feed.kick()
 
 
 def _inbox_dir() -> Path:
@@ -94,27 +142,33 @@ def _webhooks_file() -> Path:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Starts background tasks: inbox watcher + rule engine + webhook dispatcher."""
+    """Starts background tasks: inbox watcher + rule engine + event feed +
+    webhook dispatcher."""
+    global _feed
     KANBAN_DATA.mkdir(parents=True, exist_ok=True)
     inbox = InboxWatcher(_store, _inbox_dir())
     engine = RuleEngine(_store, _rules_file())
     init_dispatcher(_webhooks_file())
+    _feed = EventFeed(_store)
     inbox_task = asyncio.create_task(inbox.run(), name="inbox-watcher")
     rules_task = asyncio.create_task(engine.run(), name="rule-engine")
+    feed_task = asyncio.create_task(_feed.run(), name="event-feed")
     log.info(
-        "automation: inbox=%s rules=%s webhooks=%s",
-        _inbox_dir(), _rules_file(), _webhooks_file(),
+        "automation: db=%s inbox=%s rules=%s webhooks=%s",
+        _store.db_path, _inbox_dir(), _rules_file(), _webhooks_file(),
     )
     try:
         yield
     finally:
         inbox.stop()
         engine.stop()
-        await asyncio.gather(inbox_task, rules_task, return_exceptions=True)
+        _feed.stop()
+        await asyncio.gather(inbox_task, rules_task, feed_task, return_exceptions=True)
+        _feed = None
         await shutdown_dispatcher()
 
 
-app = FastAPI(title="Kanban", version="2.0", lifespan=lifespan)
+app = FastAPI(title="Kanban", version=__version__, lifespan=lifespan)
 
 # Optional CORS — for remote agents (e.g. Open WebUI on a different host).
 # Disabled by default: the kanban listens on 127.0.0.1, no one should reach
@@ -141,43 +195,73 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 
 
-class TaskCreate(BaseModel):
+class _Strict(BaseModel):
+    """Request bodies reject unknown fields: ``{"body": ...}`` instead of
+    ``{"description": ...}`` is a 422, not a card with an empty description."""
+    model_config = ConfigDict(extra="forbid")
+
+
+class LinkIn(_Strict):
+    type: str = Field(..., description=f"one of {', '.join(LINK_TYPES)}")
+    value: str
+
+
+class TaskCreate(_Strict):
     title: str
     description: str = ""
     acceptance: str = ""
     status: str = "backlog"
     priority: str = "normal"
     size: str = "M"
+    assignee: str | None = None
     external_blocker: str | None = None
-    links: list[dict[str, str]] = Field(default_factory=list)
+    links: list[LinkIn] = Field(default_factory=list)
     project_id: str = DEFAULT_PROJECT_ID
 
 
-class TaskUpdate(BaseModel):
+class TaskUpdate(_Strict):
     title: str | None = None
     description: str | None = None
     acceptance: str | None = None
     priority: str | None = None
     size: str | None = None
-    external_blocker: str | None = None
+    external_blocker: str | None = Field(
+        None, description='"" clears the external blocker; null leaves it unchanged'
+    )
 
 
-class MoveRequest(BaseModel):
-    to_status: str
-    column_order: int | None = None
+class AssignRequest(_Strict):
+    assignee: str | None = Field(None, description="null or empty string clears it")
+
+
+class TaskArchiveRequest(_Strict):
+    archived: bool = True
     comment: str | None = None
 
 
-class CommentRequest(BaseModel):
-    text: str
+class PauseRequest(_Strict):
+    paused: bool = True
 
 
-class LinkRequest(BaseModel):
+class MoveRequest(_Strict):
+    to_status: str
+    column_order: int | None = None
+    comment: str | None = None
+    expected_from: str | None = Field(
+        None, description="only move if the task is still in this status (409 otherwise)"
+    )
+
+
+class CommentRequest(_Strict):
+    text: str = Field(..., validation_alias=AliasChoices("text", "comment"))
+
+
+class LinkRequest(_Strict):
     type: str
     value: str
 
 
-class BlockersRequest(BaseModel):
+class BlockersRequest(_Strict):
     blocker_ids: list[str]
 
 
@@ -232,36 +316,63 @@ def index_for_project(project_id: str) -> str:
     return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
+@app.get("/p/{project_id}/t/{task_id}", response_class=HTMLResponse)
+@app.get("/t/{task_id}", response_class=HTMLResponse)
+def index_for_task(task_id: str, project_id: str | None = None) -> str:
+    """Link to one card: the board of its project with the card open."""
+    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Board
 # ---------------------------------------------------------------------------
 
 
 @app.get("/api/board")
-def get_board(project: str = Query(DEFAULT_PROJECT_ID, description="project_id")) -> dict[str, Any]:
+def get_board(
+    project: str | None = Query(None, description="project slug"),
+    project_id: str | None = Query(None, description="alias of `project`"),
+    include_archived: bool = Query(False, description="also return archived tasks"),
+) -> dict[str, Any]:
+    project = project or project_id or DEFAULT_PROJECT_ID
     columns = status_meta()
+    running: dict[str, list[str]] = {}
+    for r in rules_status()["commands"]["running"]:
+        running.setdefault(r["task_id"], []).append(r["rule"])
     proj = _store.get_project(project)
     if proj is None:
         raise HTTPException(404, f"project {project} not found")
     by_status: dict[str, list[dict[str, Any]]] = {s: [] for s in STATUSES}
-    for t in _store.list_tasks(project_id=project):
+    tasks = _store.list_tasks(project_id=project, include_archived=include_archived)
+    for t in tasks:
         by_status[t.status].append(
             {
                 "id": t.id,
                 "title": t.title,
+                # Each card carries its own status, so scripts can flatten
+                # the board without losing it.
+                "status": t.status,
                 "priority": t.priority,
                 "size": t.size,
                 "assignee": t.assignee,
                 "external_blocker": t.external_blocker,
                 "blockers": t.blockers,
+                "created_at": t.created_at,
                 "moved_at": t.moved_at,
+                "archived_at": t.archived_at,
                 "project_id": t.project_id,
+                # run_command processes currently running for this card
+                "running": running.get(t.id, []),
             }
         )
+    archived_count = 0
+    if not include_archived:
+        archived_count = len(_store.list_tasks(project_id=project, include_archived=True)) - len(tasks)
     return {
         "columns": columns,
         "tasks": by_status,
         "project": proj.to_public(),
+        "archived_count": archived_count,
     }
 
 
@@ -466,7 +577,8 @@ def setup_source_plan_new(project_id: str) -> dict[str, Any]:
         )
     plan_path = plan_md.init_plan_md(project_dir, p.id, p.name)
     plan_md.update_claude_md(
-        project_dir / "CLAUDE.md", p.id, p.name, plan_relative="PLAN.md"
+        project_dir / "CLAUDE.md", p.id, p.name, plan_relative="PLAN.md",
+        alias=detect_alias(project_dir) or DEFAULT_ALIAS,
     )
     _store.set_project_source(
         project_id, "plan_md", {"file": "PLAN.md", "absolute": str(plan_path)}
@@ -496,6 +608,11 @@ def setup_source_plan_local(
     files = [f.strip().lstrip("/") for f in files if f.strip()]
     if not files:
         raise HTTPException(400, "specify at least one file in `files`")
+    for rel in files:
+        if Path(rel).name.lower() in plan_md.NOT_PLAN_FILES:
+            raise HTTPException(
+                400, f"{rel} holds agent instructions, not a plan — pick a plan/backlog file"
+            )
 
     resolved: list[Path] = []
     for rel in files:
@@ -516,9 +633,10 @@ def setup_source_plan_local(
         per_file.append({"file": rel, **counts})
         total_created += counts["created"]
         total_skipped += counts["skipped"]
-    # CLAUDE.md highlights the first file as the canonical "write new tasks here" target.
+    # The CLAUDE.md block tells agents these files were a one-shot import.
     plan_md.update_claude_md(
-        project_dir / "CLAUDE.md", p.id, p.name, plan_relative=files[0]
+        project_dir / "CLAUDE.md", p.id, p.name, plan_files=files,
+        alias=detect_alias(project_dir) or DEFAULT_ALIAS,
     )
     _store.set_project_source(
         project_id,
@@ -557,6 +675,23 @@ def setup_source_git(project_id: str, req: SourceGitRequest) -> dict[str, Any]:
     }
 
 
+class ConnectRequest(_Strict):
+    alias: str | None = Field(None, description="server name in .mcp.json")
+    actor: str | None = Field(None, description="KANBAN_ACTOR (default: keep existing, else claude)")
+
+
+@app.post("/api/projects/{project_id}/connect")
+def connect_project(project_id: str, req: ConnectRequest) -> dict[str, Any]:
+    """Write/merge ``.mcp.json`` in the project directory and refresh its
+    CLAUDE.md block, so agents working there get the kanban tools."""
+    project_dir = _project_path_or_400(project_id)
+    try:
+        return connect_mcp(project_dir, project_id, db=_store.db_path,
+                           alias=req.alias, actor=req.actor)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise HTTPException(400, str(e))
+
+
 @app.post("/api/projects/{project_id}/archive")
 def archive_project(project_id: str, req: ProjectArchiveRequest) -> dict[str, Any]:
     if project_id == DEFAULT_PROJECT_ID and req.archived:
@@ -573,52 +708,84 @@ def archive_project(project_id: str, req: ProjectArchiveRequest) -> dict[str, An
 # ---------------------------------------------------------------------------
 
 
+# Webhooks and reactive rules are not fired from these handlers: every
+# change lands in task_history and the event feed (automation/events.py)
+# dispatches it — the same path an MCP agent's change takes. _kick() only
+# makes the feed look right away instead of on its next poll.
+
+
 @app.get("/api/tasks/{task_id}")
-def get_task(task_id: str) -> dict[str, Any]:
-    t = _store.get_task(task_id)
+def get_task(
+    task_id: str,
+    history_limit: int = Query(
+        200, ge=0, le=5000,
+        description="newest history rows to include; see /history for older ones",
+    ),
+) -> dict[str, Any]:
+    t = _store.get_task(task_id, history_limit=history_limit)
     if not t:
         raise HTTPException(404, f"task {task_id} not found")
     return t.to_public()
 
 
-def _project_payload(project_id: str | None) -> dict[str, Any] | None:
-    if not project_id:
-        return None
-    p = _store.get_project(project_id)
-    return p.to_public() if p else None
+@app.get("/api/tasks/{task_id}/history")
+def get_task_history(
+    task_id: str,
+    limit: int = Query(100, ge=1, le=1000),
+    before_id: int | None = Query(None, description="return rows older than this history id"),
+) -> dict[str, Any]:
+    try:
+        items, total = _store.history(task_id, limit=limit, before_id=before_id)
+    except KeyError:
+        raise HTTPException(404, f"task {task_id} not found")
+    return {
+        "items": [asdict(h) for h in items],
+        "total": total,
+        "next_before_id": items[0].id if items and items[0].id > 0 and len(items) == limit else None,
+    }
 
 
 @app.post("/api/tasks", status_code=201)
-async def create_task(req: TaskCreate) -> dict[str, Any]:
-    if req.status not in STATUSES:
-        raise HTTPException(400, f"unknown status: {req.status}")
+def create_task(
+    req: TaskCreate, x_kanban_actor: str | None = Header(None),
+    x_kanban_via: str | None = Header(None, include_in_schema=False),
+) -> dict[str, Any]:
+    try:
+        normalize_status(req.status)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _guard_agent_status(req.status, x_kanban_via)
     if _store.get_project(req.project_id) is None:
         raise HTTPException(400, f"unknown project: {req.project_id}")
-    t = _store.create_task(
-        title=req.title,
-        description=req.description,
-        acceptance=req.acceptance,
-        status=req.status,
-        priority=req.priority,
-        size=req.size,
-        external_blocker=req.external_blocker,
-        actor=_actor(),
-        links=req.links or None,
-        project_id=req.project_id,
-    )
-    await emit_event("task_created", {
-        "task": t.to_public(),
-        "project": _project_payload(t.project_id),
-    })
+    try:
+        t = _store.create_task(
+            title=req.title,
+            description=req.description,
+            acceptance=req.acceptance,
+            status=req.status,
+            priority=req.priority,
+            size=req.size,
+            assignee=req.assignee,
+            external_blocker=req.external_blocker,
+            actor=_actor(x_kanban_actor, x_kanban_via),
+            links=[ln.model_dump() for ln in req.links] or None,
+            project_id=req.project_id,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _kick()
     return t.to_public()
 
 
 @app.patch("/api/tasks/{task_id}")
-async def update_task(task_id: str, req: TaskUpdate) -> dict[str, Any]:
+def update_task(
+    task_id: str, req: TaskUpdate, x_kanban_actor: str | None = Header(None),
+    x_kanban_via: str | None = Header(None, include_in_schema=False),
+) -> dict[str, Any]:
     try:
         t = _store.update_fields(
             task_id,
-            actor=_actor(),
+            actor=_actor(x_kanban_actor, x_kanban_via),
             title=req.title,
             description=req.description,
             acceptance=req.acceptance,
@@ -628,78 +795,109 @@ async def update_task(task_id: str, req: TaskUpdate) -> dict[str, Any]:
         )
     except KeyError:
         raise HTTPException(404, f"task {task_id} not found")
-    changed = [
-        f for f, v in (
-            ("title", req.title), ("description", req.description),
-            ("acceptance", req.acceptance), ("priority", req.priority),
-            ("size", req.size), ("external_blocker", req.external_blocker),
-        ) if v is not None
-    ]
-    await emit_event("task_updated", {
-        "task": t.to_public(),
-        "project": _project_payload(t.project_id),
-        "changed_fields": changed,
-    })
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _kick()
     return t.to_public()
 
 
 @app.post("/api/tasks/{task_id}/move")
-async def move_task(task_id: str, req: MoveRequest) -> dict[str, Any]:
-    if req.to_status not in STATUSES:
-        raise HTTPException(400, f"unknown status: {req.to_status}")
-    pre = _store.get_task(task_id)
-    from_status = pre.status if pre else None
+def move_task(
+    task_id: str, req: MoveRequest, x_kanban_actor: str | None = Header(None),
+    x_kanban_via: str | None = Header(None, include_in_schema=False),
+) -> dict[str, Any]:
+    _guard_agent_status(req.to_status, x_kanban_via)
     try:
         t = _store.move_task(
             task_id,
             req.to_status,
-            actor=_actor(),
+            actor=_actor(x_kanban_actor, x_kanban_via),
             comment=req.comment,
             column_order=req.column_order,
+            expected_from=req.expected_from,
         )
     except KeyError:
         raise HTTPException(404, f"task {task_id} not found")
-    if from_status != req.to_status:    # only emit on an actual move
-        payload = {
-            "task": t.to_public(),
-            "project": _project_payload(t.project_id),
-            "from_status": from_status,
-            "to_status": req.to_status,
-            "comment": req.comment,
-        }
-        await emit_event("task_moved", payload)
-        emit_rule_event("task_moved", payload)
+    except StatusConflict as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _kick()
+    return t.to_public()
+
+
+@app.post("/api/tasks/{task_id}/assign")
+def assign_task(
+    task_id: str, req: AssignRequest, x_kanban_actor: str | None = Header(None),
+    x_kanban_via: str | None = Header(None, include_in_schema=False),
+) -> dict[str, Any]:
+    try:
+        t = _store.assign_task(task_id, req.assignee, actor=_actor(x_kanban_actor, x_kanban_via))
+    except KeyError:
+        raise HTTPException(404, f"task {task_id} not found")
+    _kick()
+    return t.to_public()
+
+
+@app.post("/api/tasks/{task_id}/archive")
+def archive_task(
+    task_id: str, req: TaskArchiveRequest, x_kanban_actor: str | None = Header(None),
+    x_kanban_via: str | None = Header(None, include_in_schema=False),
+) -> dict[str, Any]:
+    """Hide a task from the board (``archived=false`` restores it). The
+    status is kept — an archived ``done`` task is still ``done``."""
+    try:
+        t = _store.archive_task(
+            task_id, archived=req.archived, actor=_actor(x_kanban_actor, x_kanban_via),
+            comment=req.comment,
+        )
+    except KeyError:
+        raise HTTPException(404, f"task {task_id} not found")
+    _kick()
     return t.to_public()
 
 
 @app.post("/api/tasks/{task_id}/comment", status_code=201)
-async def add_comment(task_id: str, req: CommentRequest) -> dict[str, Any]:
+def add_comment(
+    task_id: str, req: CommentRequest, x_kanban_actor: str | None = Header(None),
+    x_kanban_via: str | None = Header(None, include_in_schema=False),
+) -> dict[str, Any]:
     try:
-        _store.add_comment(task_id, req.text, actor=_actor())
+        _store.add_comment(task_id, req.text, actor=_actor(x_kanban_actor, x_kanban_via))
     except KeyError:
         raise HTTPException(404, f"task {task_id} not found")
-    t = _store.get_task(task_id)
-    if t:
-        await emit_event("task_commented", {
-            "task": t.to_public(),
-            "project": _project_payload(t.project_id),
-            "comment": req.text,
-        })
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _kick()
     return {"ok": True}
 
 
 @app.post("/api/tasks/{task_id}/links", status_code=201)
 def add_link(task_id: str, req: LinkRequest) -> dict[str, Any]:
-    if req.type not in {"memory", "file", "pr", "url"}:
-        raise HTTPException(400, "type must be memory/file/pr/url")
-    _store.add_link(task_id, req.type, req.value)
-    return {"ok": True}
+    try:
+        added = _store.add_link(task_id, req.type, req.value)
+    except KeyError:
+        raise HTTPException(404, f"task {task_id} not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "added": added}
 
 
 @app.post("/api/tasks/{task_id}/blockers")
-def set_blockers(task_id: str, req: BlockersRequest) -> dict[str, Any]:
-    _store.set_blockers(task_id, req.blocker_ids)
-    return {"ok": True, "blockers": req.blocker_ids}
+def set_blockers(
+    task_id: str, req: BlockersRequest, x_kanban_actor: str | None = Header(None),
+    x_kanban_via: str | None = Header(None, include_in_schema=False),
+) -> dict[str, Any]:
+    try:
+        stored = _store.set_blockers(
+            task_id, req.blocker_ids, actor=_actor(x_kanban_actor, x_kanban_via)
+        )
+    except KeyError:
+        raise HTTPException(404, f"task {task_id} not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _kick()
+    return {"ok": True, "blockers": stored}
 
 
 # ---------------------------------------------------------------------------
@@ -720,12 +918,27 @@ def snapshot() -> dict[str, Any]:
 
 @app.get("/api/automation/status")
 def get_automation_status() -> dict[str, Any]:
-    """State of the inbox watcher, rule engine, and webhook dispatcher."""
+    """State of the inbox watcher, rule engine, event feed and webhook dispatcher."""
     return {
+        "version": __version__,
+        "db": str(_store.db_path),
         "inbox": inbox_status(),
         "rules": rules_status(),
+        "events": events_status(),
         "webhooks": webhooks_status(),
     }
+
+
+@app.post("/api/automation/pause")
+async def pause_automation(req: PauseRequest) -> dict[str, Any]:
+    """Pause (or resume) every automation rule — a kill switch for runaway
+    agent pipelines. Writes ``"paused"`` into rules.json; events that happen
+    while paused are not replayed later."""
+    try:
+        set_paused(_rules_file(), req.paused)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise HTTPException(400, f"cannot update rules.json: {e}")
+    return {"ok": True, "paused": rules_status()["paused"]}
 
 
 # ---------------------------------------------------------------------------
@@ -853,9 +1066,6 @@ async def claude_auth_login() -> dict[str, Any]:
     }
 
 
-import json  # noqa: E402  (used by claude_auth_status)
-
-
 @app.post("/api/system/pick-folder")
 async def pick_folder() -> dict[str, Any]:
     """Opens a native folder picker dialog (macOS / Linux+zenity / Windows).
@@ -946,7 +1156,7 @@ async def pick_file(default_location: str = "") -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Streamable HTTP MCP transport (mounted at /mcp).
+# HTTP MCP transports (streamable HTTP at /mcp, SSE at /sse).
 # ---------------------------------------------------------------------------
 #
 # Exposes the REST endpoints above as MCP tools over HTTP, so clients that
@@ -954,7 +1164,27 @@ async def pick_file(default_location: str = "") -> dict[str, Any]:
 # can attach without running a separate process. Parallel to the legacy
 # stdio server in ``kanban_mcp/`` — Claude Code's ``.mcp.json`` continues
 # to use stdio.
+from fastapi.routing import APIRoute  # noqa: E402
 from fastapi_mcp import FastApiMCP  # noqa: E402
+
+# Endpoints that act on the host (native file dialogs, CLI login, writing
+# into project directories) or switch automation off are for the human in
+# the browser, not for MCP clients.
+_MCP_EXCLUDED = [
+    r.unique_id for r in app.routes
+    if isinstance(r, APIRoute) and (
+        r.path.startswith("/api/system/")
+        or r.path == "/api/automation/pause"
+        # write files into the project directory / store a git token
+        or r.path.startswith("/api/projects/{project_id}/source")
+        or r.path == "/api/projects/{project_id}/connect"
+        # creating/repointing projects: project.path is where the agent
+        # launcher runs `claude` with shell access
+        or (r.path.startswith("/api/projects") and not r.methods <= {"GET", "HEAD"})
+    )
+]
+
+import httpx  # noqa: E402
 
 _mcp_http = FastApiMCP(
     app,
@@ -963,6 +1193,21 @@ _mcp_http = FastApiMCP(
         "Local-first kanban for AI-agent workflows. Drag a task to Approved "
         "and your AI agent drives it through analyst → in_progress → testing."
     ),
+    exclude_operations=_MCP_EXCLUDED,
+    # Same in-process transport fastapi-mcp builds by default, plus a marker
+    # header so the endpoints know the caller is an MCP client (agent rules,
+    # actor name). Clients can still name themselves via X-Kanban-Actor.
+    http_client=httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://apiserver",
+        timeout=30.0,
+        headers={"X-Kanban-Via": MCP_VIA},
+    ),
+    headers=["authorization", "x-kanban-actor"],
 )
-_mcp_http.mount()
-log.info("HTTP MCP mounted at /mcp")
+# Streamable HTTP (the current MCP transport) at /mcp; legacy SSE at /sse for
+# clients that only speak SSE. (v0.1.x mounted SSE at /mcp via the deprecated
+# mount().)
+_mcp_http.mount_http(mount_path="/mcp")
+_mcp_http.mount_sse(mount_path="/sse")
+log.info("HTTP MCP mounted: streamable HTTP at /mcp, SSE at /sse")
