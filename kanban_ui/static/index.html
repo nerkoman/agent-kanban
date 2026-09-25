@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Cinzel:wght@500;600;700&family=Marcellus&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=2026-05-09-en1" />
+  <link rel="stylesheet" href="/static/styles.css?v=0.2.0" />
   <script>
     // Apply saved theme and profile before body parses — no flash of wrong styles.
     // Also accept ?theme=light|dark and ?profile=standard|cyberpunk|horizon
@@ -73,6 +73,7 @@
           <button class="filter-chip" data-filter="unassigned" title="No assignee">Unassigned</button>
         </div>
         <div class="topbar__actions">
+          <button class="btn btn--icon automation-toggle" id="btn-automation" title="Pause automation (rules, agent launches)" aria-label="Automation">⏸</button>
           <button class="btn btn--icon claude-auth claude-auth--unknown" id="btn-claude-auth" title="Claude CLI status" aria-label="Claude auth">
             <span class="claude-auth__mark">C</span>
           </button>
@@ -85,6 +86,10 @@
         </div>
       </header>
 
+      <div class="paused-banner" id="paused-banner" hidden>
+        Automation is paused — rules don't act and no agents are launched.
+        <button class="btn btn--ghost" id="btn-resume-automation">Resume</button>
+      </div>
       <main class="board" id="board">
         <!-- columns rendered by app.js -->
       </main>
@@ -110,6 +115,7 @@
           <div class="field">
             <label>Priority</label>
             <select id="m-priority">
+              <option value="critical">Critical</option>
               <option value="high">High</option>
               <option value="normal">Normal</option>
               <option value="low">Low</option>
@@ -121,11 +127,12 @@
               <option value="S">S — &lt;30 min</option>
               <option value="M">M — &lt;2 h</option>
               <option value="L">L — &gt;2 h</option>
+              <option value="XL">XL</option>
             </select>
           </div>
           <div class="field">
             <label>Assignee</label>
-            <input type="text" id="m-assignee" readonly placeholder="—" />
+            <input type="text" id="m-assignee" placeholder="— (e.g. claude, agent:reviewer)" />
           </div>
         </div>
         <div class="field">
@@ -138,7 +145,7 @@
         </div>
         <div class="field">
           <label>External blocker</label>
-          <input type="text" id="m-blocker" placeholder="e.g. DevOps: monitoring.viewer" />
+          <input type="text" id="m-blocker" placeholder="e.g. DevOps: monitoring.viewer (empty = none)" />
         </div>
         <div class="field">
           <label>Links</label>
@@ -149,6 +156,7 @@
               <option value="file">file</option>
               <option value="pr">pr</option>
               <option value="url">url</option>
+              <option value="plan">plan</option>
             </select>
             <input type="text" id="m-link-value" placeholder="filename or url" />
             <button class="btn btn--ghost" id="btn-add-link">+</button>
@@ -167,6 +175,7 @@
         </div>
       </div>
       <footer class="modal__foot">
+        <button class="btn btn--ghost modal__foot-left" id="btn-archive-task" title="Hide from the board, keep the status">Archive</button>
         <button class="btn btn--ghost" data-close>Cancel</button>
         <button class="btn btn--primary" id="btn-save">Save</button>
       </footer>
@@ -179,7 +188,7 @@
     <div class="modal__panel">
       <header class="modal__head">
         <span class="task-id">New task</span>
-        <span class="chip chip--status" id="n-proj-chip">FinOps</span>
+        <span class="chip chip--status" id="n-proj-chip">—</span>
         <button class="btn btn--icon" data-close-new aria-label="Close">×</button>
       </header>
       <div class="modal__body">
@@ -200,6 +209,7 @@
             <label>Priority</label>
             <select id="n-priority">
               <option value="normal">Normal</option>
+              <option value="critical">Critical</option>
               <option value="high">High</option>
               <option value="low">Low</option>
             </select>
@@ -210,6 +220,7 @@
               <option value="M">M</option>
               <option value="S">S</option>
               <option value="L">L</option>
+              <option value="XL">XL</option>
             </select>
           </div>
         </div>
@@ -279,9 +290,11 @@
 
           <div class="source-pane" data-pane="new">
             <p class="source-hint">
-              Kanban will create <code>PLAN.md</code> in the directory and add an
-              instruction block to <code>CLAUDE.md</code>: Claude writes new tasks
-              to <code>PLAN.md</code>, and Kanban picks them up.
+              Kanban creates an empty <code>PLAN.md</code> in the directory (for a
+              one-time import of a plan you write before connecting) and adds an
+              instruction block to <code>CLAUDE.md</code>. After that, agents file
+              new tasks with <code>kanban_create</code> — editing the file later
+              does not change the board.
             </p>
           </div>
 
@@ -299,9 +312,9 @@
               are checked automatically. The parser reads
               <code>## Backlog</code>, <code>## In progress</code>,
               <code>## Done</code> headings and the like — every
-              <code>- [ ] ...</code> line becomes a card. After import we update
-              <code>CLAUDE.md</code> so Claude writes new tasks to the first
-              selected file.
+              <code>- [ ] ...</code> line becomes a card. The import runs once;
+              <code>CLAUDE.md</code> then tells agents to file new tasks with
+              <code>kanban_create</code>.
             </p>
           </div>
 
@@ -315,6 +328,12 @@
               Issue import will arrive in the next release.
             </p>
           </div>
+
+          <label class="connect-row">
+            <input type="checkbox" id="p-connect" checked />
+            Connect Claude Code in this directory: write <code>.mcp.json</code> with the
+            kanban MCP server (other servers and your settings in the file are kept)
+          </label>
 
           <div class="source-current" id="source-current" hidden>
             <strong>Current source:</strong>
@@ -332,6 +351,6 @@
   <div class="toast" id="toast" hidden></div>
 
   <script src="/static/vendor/Sortable.min.js"></script>
-  <script src="/static/app.js?v=2026-05-09-en1"></script>
+  <script src="/static/app.js?v=0.2.0"></script>
 </body>
 </html>

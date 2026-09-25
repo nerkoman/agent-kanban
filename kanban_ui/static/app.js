@@ -1,6 +1,7 @@
-/* FinOps Kanban frontend v2.
- * Multi-project (URL /p/{slug}), drag-drop, search+filter, collapsible cols,
- * compact mode, quick-add, keyboard shortcuts, polling /api/board every 10 s.
+/* agent-kanban frontend.
+ * Multi-project (URL /p/{slug}, card links /p/{slug}/t/{id} and /t/{id}),
+ * drag-drop, search+filter, collapsible cols, compact mode, quick-add,
+ * keyboard shortcuts, polling /api/board every 10 s.
  */
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -51,7 +52,13 @@ const state = {
   collapsedCols: _loadJSON(LS.COLLAPSED_COLS),
   expandedCols:  _loadJSON(LS.EXPANDED_COLS),
   isDragging: false,
+  showArchived: false,             // include archived cards on the board
+  automationPaused: false,
+  modalTask: null,                 // task currently open in the modal
 };
+
+// Columns where "how long has it been sitting here" matters.
+const AGE_COLUMNS = new Set(["approved", "analyst", "in_progress", "testing", "uat", "blocked"]);
 
 function _loadJSON(key) {
   try {
@@ -92,8 +99,13 @@ function toast(msg, kind = "info") {
 // ----------------------------------------------------------- URL routing
 
 function parseRoute() {
-  const m = location.pathname.match(/^\/p\/([a-z][a-z0-9-]*)\/?$/);
+  const m = location.pathname.match(/^\/p\/([a-z][a-z0-9-]*)(?:\/t\/[^/]+)?\/?$/);
   return m ? m[1] : null;     // null = not picked yet, will fall back to first project
+}
+
+function parseTaskRoute() {
+  const m = location.pathname.match(/^(?:\/p\/[a-z][a-z0-9-]*)?\/t\/([^/]+)\/?$/);
+  return m ? decodeURIComponent(m[1]) : null;
 }
 
 function navigateTo(projectId, { replace = false } = {}) {
@@ -110,6 +122,24 @@ function escapeHTML(s) {
   return String(s ?? "").replace(/[&<>"']/g, (m) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   })[m]);
+}
+
+function localTime(ts, withDate = true) {
+  // History timestamps are UTC ISO strings; show them in the viewer's zone.
+  const d = new Date(ts);
+  if (isNaN(d)) return ts;
+  const opts = { hour: "2-digit", minute: "2-digit" };
+  if (withDate) Object.assign(opts, { day: "2-digit", month: "2-digit" });
+  return d.toLocaleString(undefined, opts);
+}
+
+function ageLabel(ts) {
+  const ms = Date.now() - new Date(ts).getTime();
+  if (!(ms >= 0)) return "";
+  const h = ms / 3600000;
+  if (h < 1) return `${Math.max(1, Math.round(ms / 60000))}m`;
+  if (h < 48) return `${Math.round(h)}h`;
+  return `${Math.round(h / 24)}d`;
 }
 
 function ownerLabel(owner) {
@@ -244,22 +274,46 @@ function render(board) {
   // density
   root.classList.toggle("is-compact", state.density === "compact");
   // stats
+  renderStats(visible, total);
+}
+
+function renderStats(visible, total) {
   const filterLabel = (state.search || state.filters.size > 0)
     ? `${visible} / ${total}` : `${total}`;
-  $("#stats").textContent = `${filterLabel} tasks`;
+  const el = $("#stats");
+  el.textContent = `${filterLabel} tasks`;
+  const archived = state.board.archived_count || 0;
+  if (archived || state.showArchived) {
+    const a = document.createElement("button");
+    a.className = "stats__archived";
+    a.title = "Archived cards are hidden from the board; their status is kept";
+    a.textContent = state.showArchived ? " · hide archived" : ` · ${archived} archived`;
+    a.addEventListener("click", () => {
+      state.showArchived = !state.showArchived;
+      loadBoard();
+    });
+    el.appendChild(a);
+  }
 }
 
 function cardEl(t) {
   const div = document.createElement("article");
   div.className = "card";
-  if (t.priority === "high") div.classList.add("is-prio-high");
+  if (t.priority === "high" || t.priority === "critical") div.classList.add("is-prio-high");
+  if (t.archived_at) div.classList.add("is-archived");
   div.dataset.taskId = t.id;
+  const running = (t.running || []).length > 0;
+  const age = AGE_COLUMNS.has(t.status) && t.moved_at ? ageLabel(t.moved_at) : "";
   div.innerHTML = `
     <div class="card__row">
       <span class="card__id">${t.id}</span>
+      ${t.priority === "critical" ? `<span class="chip chip--prio-high">CRIT</span>` : ""}
       ${t.priority === "high" ? `<span class="chip chip--prio-high">HIGH</span>` : ""}
-      <span class="chip chip--size-${t.size}">${t.size}</span>
+      <span class="chip chip--size-${escapeHTML(t.size)}">${escapeHTML(t.size)}</span>
       ${t.assignee ? `<span class="chip chip--assignee">${escapeHTML(t.assignee)}</span>` : ""}
+      ${running ? `<span class="chip chip--running" title="Running now: ${escapeHTML(t.running.join(", "))}">▶ agent</span>` : ""}
+      ${age ? `<span class="chip chip--age" title="In this column since ${escapeHTML(localTime(t.moved_at))}">${age}</span>` : ""}
+      ${t.archived_at ? `<span class="chip chip--age" title="Archived ${escapeHTML(localTime(t.archived_at))}">archived</span>` : ""}
     </div>
     <div class="card__title">${escapeHTML(t.title)}</div>
     ${t.external_blocker ? `<div class="card__meta"><span class="card__blocker" title="${escapeHTML(t.external_blocker)}">${escapeHTML(t.external_blocker)}</span></div>` : ""}
@@ -313,9 +367,7 @@ function applyFilters() {
       }
     }
   }
-  const filterLabel = (state.search || state.filters.size > 0)
-    ? `${visible} / ${total}` : `${total}`;
-  $("#stats").textContent = `${filterLabel} tasks`;
+  renderStats(visible, total);
 }
 
 // ----------------------------------------------------------- Collapsed columns
@@ -426,17 +478,21 @@ async function handleDrop(evt) {
 
 // ----------------------------------------------------------- Task modal
 
+const HISTORY_LIMIT = 200;
+
 async function openTaskModal(taskId) {
   let t;
   try {
-    t = await api("GET", `/api/tasks/${taskId}`);
+    t = await api("GET", `/api/tasks/${encodeURIComponent(taskId)}?history_limit=${HISTORY_LIMIT}`);
   } catch (e) {
     toast(`Failed to load ${taskId}`, "err");
     return;
   }
+  state.modalTask = t;
   $("#modal").dataset.taskId = t.id;
   $("#m-id").textContent = t.id;
-  $("#m-status").textContent = STATUS_TITLE[t.status] || t.status;
+  $("#m-id").title = "Copy link to this card";
+  $("#m-status").textContent = (STATUS_TITLE[t.status] || t.status) + (t.archived_at ? " · archived" : "");
   $("#m-title").value = t.title || "";
   $("#m-priority").value = t.priority || "normal";
   $("#m-size").value = t.size || "M";
@@ -444,10 +500,38 @@ async function openTaskModal(taskId) {
   $("#m-description").value = t.description || "";
   $("#m-acceptance").value = t.acceptance || "";
   $("#m-blocker").value = t.external_blocker || "";
+  $("#btn-archive-task").textContent = t.archived_at ? "Unarchive" : "Archive";
   renderLinks(t.links);
-  renderHistory(t.history);
+  renderHistory(t.history, t.history_total);
   $("#m-comment").value = "";
   $("#modal").hidden = false;
+  history.replaceState(history.state, "", `/p/${t.project_id}/t/${encodeURIComponent(t.id)}`);
+}
+
+async function copyTaskLink() {
+  const t = state.modalTask;
+  if (!t) return;
+  const url = `${location.origin}/p/${t.project_id}/t/${encodeURIComponent(t.id)}`;
+  try {
+    await navigator.clipboard.writeText(url);
+    toast("Link copied");
+  } catch {
+    toast(url);
+  }
+}
+
+async function toggleArchiveTask() {
+  const t = state.modalTask;
+  if (!t) return;
+  try {
+    await api("POST", `/api/tasks/${encodeURIComponent(t.id)}/archive`, { archived: !t.archived_at });
+    toast(t.archived_at ? `${t.id} restored to the board` : `${t.id} archived`);
+    closeModal();
+    await loadBoard();
+    await loadProjects();
+  } catch (e) {
+    toast(`Error: ${e.message}`, "err");
+  }
 }
 
 function renderLinks(links) {
@@ -463,13 +547,20 @@ function renderLinks(links) {
   }
 }
 
-function renderHistory(history) {
+function renderHistory(history, total) {
   const el = $("#m-history");
   el.innerHTML = "";
+  const hidden = (total || 0) - (history || []).length;
+  if (hidden > 0) {
+    const more = document.createElement("div");
+    more.className = "h-row h-more";
+    more.textContent = `${hidden} older entries not shown (GET /api/tasks/{id}/history pages through them)`;
+    el.appendChild(more);
+  }
   for (const h of (history || [])) {
     const row = document.createElement("div");
     row.className = "h-row";
-    const ts = h.ts.slice(5, 16).replace("T", " ");
+    const ts = localTime(h.ts);
     const text = h.action === "move"
       ? `${h.from_status || "—"} → ${h.to_status || "—"}` + (h.comment ? ` — ${h.comment}` : "")
       : (h.comment || "");
@@ -487,8 +578,13 @@ function renderHistory(history) {
 }
 
 function closeModal() {
+  const wasOpen = !$("#modal").hidden;
   $("#modal").hidden = true;
   delete $("#modal").dataset.taskId;
+  state.modalTask = null;
+  if (wasOpen && state.projectId && parseTaskRoute()) {
+    history.replaceState(history.state, "", `/p/${state.projectId}`);
+  }
 }
 
 async function saveModal() {
@@ -500,10 +596,15 @@ async function saveModal() {
     acceptance: $("#m-acceptance").value,
     priority: $("#m-priority").value,
     size: $("#m-size").value,
-    external_blocker: $("#m-blocker").value.trim() || null,
+    // "" clears the blocker (null would mean "leave unchanged")
+    external_blocker: $("#m-blocker").value.trim(),
   };
+  const assignee = $("#m-assignee").value.trim();
   try {
     await api("PATCH", `/api/tasks/${taskId}`, payload);
+    if (state.modalTask && (state.modalTask.assignee || "") !== assignee) {
+      await api("POST", `/api/tasks/${taskId}/assign`, { assignee: assignee || null });
+    }
     toast(`${taskId} saved`);
     closeModal();
     await loadBoard();
@@ -521,7 +622,7 @@ async function addLink() {
   try {
     await api("POST", `/api/tasks/${taskId}/links`, { type, value });
     $("#m-link-value").value = "";
-    const t = await api("GET", `/api/tasks/${taskId}`);
+    const t = await api("GET", `/api/tasks/${taskId}?history_limit=0`);
     renderLinks(t.links);
   } catch (e) {
     toast(`Error: ${e.message}`, "err");
@@ -536,8 +637,8 @@ async function addComment() {
   try {
     await api("POST", `/api/tasks/${taskId}/comment`, { text });
     $("#m-comment").value = "";
-    const t = await api("GET", `/api/tasks/${taskId}`);
-    renderHistory(t.history);
+    const t = await api("GET", `/api/tasks/${taskId}?history_limit=${HISTORY_LIMIT}`);
+    renderHistory(t.history, t.history_total);
   } catch (e) {
     toast(`Error: ${e.message}`, "err");
   }
@@ -752,6 +853,7 @@ function openNewProj() {
   $("#p-path").value = "";
   $$(".swatch").forEach(s => s.classList.toggle("is-active", s.dataset.color === "#F10D30"));
   resetSourceWizard();
+  $("#p-connect").checked = true;    // new project: offer .mcp.json by default
   $("#proj-modal").hidden = false;
   $("#p-name").focus();
 }
@@ -767,6 +869,9 @@ function openEditProj(p) {
   $$(".swatch").forEach(s => s.classList.toggle("is-active", s.dataset.color === p.color));
   resetSourceWizard();
   showCurrentSource(p.id);
+  // Editing (renaming, recolouring) must not rewrite .mcp.json behind the
+  // user's back — only when they tick the box.
+  $("#p-connect").checked = false;
   $("#proj-modal").hidden = false;
   $("#p-name").focus();
 }
@@ -788,7 +893,7 @@ async function saveProj() {
   if (!name) { toast("Name is required", "err"); return; }
 
   // Pre-validation: types new/local require a path. Otherwise the wizard does
-  // nothing and the user ends up with an empty board (as happened with Aizav2).
+  // nothing and the user ends up with an empty board.
   if ((activeSourceTab === "new" || activeSourceTab === "local") && !path) {
     toast("First specify the project directory (field \"Project directory\")", "err");
     $("#p-path").focus();
@@ -836,9 +941,21 @@ async function saveProj() {
   }
 
   // Setup source
+  const results = [];
   const sourceResult = await applySourceWizard(savedId, path);
+  if (sourceResult) results.push(sourceResult);
+  // Give agents in that directory the kanban tools (.mcp.json + CLAUDE.md).
+  if (path && $("#p-connect").checked) {
+    try {
+      const c = await api("POST", `/api/projects/${savedId}/connect`, {});
+      results.push(`.mcp.json → server "${c.alias}"`);
+    } catch (e) {
+      toast(`Connect Claude Code: ${e.message}`, "err");
+    }
+  }
+  const suffix = results.length ? " · " + results.join(" · ") : "";
 
-  toast(editingProjId ? `Project ${name} saved${sourceResult ? " · " + sourceResult : ""}` : `Project ${name} created${sourceResult ? " · " + sourceResult : ""}`);
+  toast(editingProjId ? `Project ${name} saved${suffix}` : `Project ${name} created${suffix}`);
   closeNewProj();
   await loadProjects();
   if (!editingProjId) navigateTo(savedId);
@@ -1016,6 +1133,33 @@ function toggleProfile() {
 
 // ----------------------------------------------------------- Loaders
 
+// ----------------------------------------------------------- Automation pause
+
+async function refreshAutomation() {
+  try {
+    const st = await api("GET", "/api/automation/status");
+    state.automationPaused = !!(st.rules && st.rules.paused);
+  } catch { return; }
+  const btn = $("#btn-automation");
+  btn.classList.toggle("is-paused", state.automationPaused);
+  btn.textContent = state.automationPaused ? "▶" : "⏸";
+  btn.title = state.automationPaused
+    ? "Automation is PAUSED — rules and agent launches are off. Click to resume."
+    : "Pause automation (rules, agent launches)";
+  $("#paused-banner").hidden = !state.automationPaused;
+}
+
+async function toggleAutomation() {
+  const next = !state.automationPaused;
+  try {
+    await api("POST", "/api/automation/pause", { paused: next });
+    toast(next ? "Automation paused" : "Automation resumed");
+  } catch (e) {
+    toast(`Error: ${e.message}`, "err");
+  }
+  await refreshAutomation();
+}
+
 async function loadProjects() {
   try {
     const r = await api("GET", "/api/projects?include_archived=true");
@@ -1033,7 +1177,9 @@ async function loadBoard() {
   if ($("#new-modal").hidden === false) return;
   if ($("#proj-modal").hidden === false) return;
   try {
-    const board = await api("GET", `/api/board?project=${encodeURIComponent(state.projectId)}`);
+    const qs = `project=${encodeURIComponent(state.projectId)}` +
+      (state.showArchived ? "&include_archived=true" : "");
+    const board = await api("GET", `/api/board?${qs}`);
     render(board);
   } catch (e) {
     if (String(e.message).includes("HTTP 404")) {
@@ -1143,6 +1289,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#btn-theme").addEventListener("click", toggleTheme);
   $("#btn-profile").addEventListener("click", toggleProfile);
   $("#btn-claude-auth").addEventListener("click", clickClaudeAuth);
+  $("#btn-automation").addEventListener("click", toggleAutomation);
+  $("#btn-resume-automation").addEventListener("click", toggleAutomation);
+  $("#btn-archive-task").addEventListener("click", toggleArchiveTask);
+  $("#m-id").addEventListener("click", copyTaskLink);
+  refreshAutomation();
+  setInterval(refreshAutomation, 30000);
   $("#btn-sidebar").addEventListener("click", toggleSidebar);
   // Initial claude auth state + periodic refresh every 60 s
   refreshClaudeAuth();
@@ -1251,6 +1403,17 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Initial load: projects first, then select + board
   await loadProjects();
+  const linkedTask = parseTaskRoute();
+  let linked = null;
+  if (linkedTask) {
+    try {
+      linked = await api("GET", `/api/tasks/${encodeURIComponent(linkedTask)}?history_limit=0`);
+      state.projectId = linked.project_id;
+      if (linked.archived_at) state.showArchived = true;
+    } catch {
+      toast(`Card ${linkedTask} not found`, "err");
+    }
+  }
   if (!state.projectId && state.projects.length > 0) {
     // URL without /p/X — priority:
     // 1) last opened from localStorage (if it still exists and isn't archived)
@@ -1265,6 +1428,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     await loadBoard();
     renderSidebar();
   }
+  if (linked) await openTaskModal(linked.id);
 
   // Polling
   setInterval(() => { loadBoard(); loadProjects(); }, 10000);
