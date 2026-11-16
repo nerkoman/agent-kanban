@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  agent-kanban:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7777:7777"
+    environment:
+      - KANBAN_HOST=0.0.0.0
+      - KANBAN_PORT=7777
+      - KANBAN_DB=/app/kanban_data/tasks.db
+      - KANBAN_DEFAULT_PROJECT_ID=default
+      - KANBAN_DEFAULT_PROJECT_NAME=Default
+      - KANBAN_DEFAULT_PROJECT_COLOR=#F10D30
+      - KANBAN_INBOX_DIR=/app/kanban_data/inbox
+      - KANBAN_RULES_FILE=/app/kanban_data/rules.json
+      - KANBAN_WEBHOOKS_FILE=/app/kanban_data/webhooks.json
+      - KANBAN_AUTOMATION_INTERVAL=60
+      - KANBAN_EVENTS_INTERVAL=1
+      - KANBAN_EVENTS_QUIET_ACTORS=plan-import,maintenance
+      - KANBAN_RULE_LOOP_LIMIT=5
+      - KANBAN_INBOX_INTERVAL=5
+    volumes:
+      - kanban_data:/app/kanban_data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7777/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - kanban-network
+
+volumes:
+  kanban_data:
+    driver: local
+
+networks:
+  kanban-network:
+    driver: bridge
