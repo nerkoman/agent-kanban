@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
@@ -927,6 +927,12 @@ def get_automation_status() -> dict[str, Any]:
         "events": events_status(),
         "webhooks": webhooks_status(),
     }
+
+
+@app.get("/health", response_class=JSONResponse)
+def health_check() -> dict[str, str]:
+    """Health check endpoint for Docker and monitoring."""
+    return {"status": "healthy", "version": __version__}
 
 
 @app.post("/api/automation/pause")
