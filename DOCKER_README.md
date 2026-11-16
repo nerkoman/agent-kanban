@@ -113,6 +113,30 @@ All data is stored in the `kanban_data` volume:
 - `webhooks.json` - Webhook configurations
 - `logs/` - Rule execution logs
 
+### Using Host Filesystem Mount
+
+Instead of Docker volumes, you can mount a host directory. This is useful for backups or direct file access.
+
+**Linux/WSL:**
+```bash
+mkdir -p kanban_data/{inbox,logs,rules,webhooks}
+chown -R 1000:1000 kanban_data
+```
+
+**Windows (PowerShell):**
+```powershell
+mkdir kanban_data\inbox, kanban_data\logs, kanban_data\rules, kanban_data\webhooks
+```
+
+Then update `docker-compose.yml`:
+
+```yaml
+volumes:
+  - /d/src/agent-kanban/kanban_data:/app/kanban_data  # Windows path format
+```
+
+**Note:** When using host mounts, the container must run as root (`user: "0:0"`) or the directory must be owned by UID 1000 (the `appuser` inside the container). For Windows, running as root is the simplest solution.
+
 ### Updating
 
 To update to a newer version:
